@@ -1,0 +1,136 @@
+package fsm
+
+import (
+	"errors"
+	"fmt"
+)
+
+// EventGraph declares the states of a machine and the labeled transitions between them.
+//
+// Each edge is identified by the pair (from, event) and resolves to exactly one target state. An event may fan out, so
+// the same event name may lead to different targets from different source states, and several events may reach the same
+// target. A state with no outgoing edge is terminal; terminal states need not be declared, since they are simply
+// targets nothing leaves.
+//
+// The zero value is an empty graph that permits no transition. Build one with NewEventGraph. A built graph is sealed:
+// it holds its own copy of the edges, so later use of the builder that produced it cannot change what it allows.
+//
+// Example:
+//
+//	graph := fsm.NewEventGraph[OrderState, OrderEvent]().
+//		On(StateDraft, EventSubmit, StateReview).
+//		MustBuild()
+type EventGraph[S ~string, E ~string] struct {
+	edges map[S]map[E]S
+}
+
+// NewEventGraph returns an empty builder for a graph whose states are of type S and whose events are of type E.
+//
+// Both type parameters are constrained to ~string, so callers declare their own named string types. That keeps one
+// machine's states from being accepted by another, while error messages stay readable and stored values round-trip
+// without conversion.
+//
+// Example:
+//
+//	type OrderState string
+//	type OrderEvent string
+//
+//	builder := fsm.NewEventGraph[OrderState, OrderEvent]()
+func NewEventGraph[S, E ~string]() *EventGraphBuilder[S, E] {
+	return &EventGraphBuilder[S, E]{edges: map[S]map[E]S{}}
+}
+
+// EventGraphBuilder accumulates edges and the conflicts found while declaring them.
+//
+// Every method returns the builder, so declarations chain. Conflicts are not reported as they happen; they are
+// collected and surfaced together by Build or MustBuild.
+//
+// Example:
+//
+//	builder := fsm.NewEventGraph[OrderState, OrderEvent]()
+//	builder = builder.On(StateDraft, EventSubmit, StateReview)
+//	graph, err := builder.Build()
+type EventGraphBuilder[S ~string, E ~string] struct {
+	edges map[S]map[E]S
+	errs  []error
+}
+
+// On declares that firing event while in from moves the machine to.
+//
+// Declaring the pair (from, event) more than once is a conflict, recorded and reported by Build or MustBuild. The first
+// declaration wins, so a conflicting later one never silently replaces an earlier edge. Re-declaring an identical edge
+// is a conflict too: it is a copy-paste mistake rather than an intent to change anything.
+//
+// Example:
+//
+//	builder.On(StateDraft, EventSubmit, StateReview)
+//	// firing EventSubmit in StateDraft now leads to StateReview
+func (b *EventGraphBuilder[S, E]) On(from S, event E, to S) *EventGraphBuilder[S, E] {
+	if b.edges[from] == nil {
+		b.edges[from] = map[E]S{}
+	}
+
+	if prev, exists := b.edges[from][event]; exists {
+		b.errs = append(b.errs, fmt.Errorf("duplicate edge (%s, %s): -> %s and -> %s", from, event, prev, to))
+
+		return b
+	}
+
+	b.edges[from][event] = to
+
+	return b
+}
+
+// Build returns the declared graph, or every conflict found while declaring it.
+//
+// Conflicts are joined with errors.Join, so a graph with several mistakes reports all of them at once rather than one
+// per attempt. Use Build when the graph is assembled conditionally and the error has somewhere to go; use MustBuild for
+// a package-level variable.
+//
+// The graph is returned even when the error is non-nil, holding the edges declared before each conflict. That makes the
+// first-declaration-wins rule observable rather than theoretical.
+//
+// Example:
+//
+//	graph, err := builder.Build()
+//	if err != nil {
+//		// duplicate edge (Draft, submit): -> Review and -> Paid
+//	}
+func (b *EventGraphBuilder[S, E]) Build() (EventGraph[S, E], error) {
+	graph := EventGraph[S, E]{edges: make(map[S]map[E]S, len(b.edges))}
+
+	for from, byEvent := range b.edges {
+		targets := make(map[E]S, len(byEvent))
+		for event, to := range byEvent {
+			targets[event] = to
+		}
+
+		graph.edges[from] = targets
+	}
+
+	if len(b.errs) > 0 {
+		return graph, errors.Join(b.errs...)
+	}
+
+	return graph, nil
+}
+
+// MustBuild returns the declared graph and panics if any conflict was found.
+//
+// A graph is static configuration built once at start-up, so a conflict is a programmer mistake that should surface
+// immediately and loudly rather than being handled. This is the regexp.MustCompile pattern, and it is what a
+// package-level variable needs, since a variable initializer cannot handle an error.
+//
+// Example:
+//
+//	var orderGraph = fsm.NewEventGraph[OrderState, OrderEvent]().
+//		On(StateDraft, EventSubmit, StateReview).
+//		MustBuild()
+func (b *EventGraphBuilder[S, E]) MustBuild() EventGraph[S, E] {
+	graph, err := b.Build()
+	if err != nil {
+		panic(err)
+	}
+
+	return graph
+}
