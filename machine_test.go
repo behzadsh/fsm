@@ -54,7 +54,7 @@ func TestNewEventMachine(t *testing.T) {
 	}
 }
 
-// Constructing against an empty graph must fail for every state, since an empty graph declares no states at all.
+// Constructing against an empty graph fails for every state, since an empty graph declares no states.
 func TestNewEventMachineEmptyGraph(t *testing.T) {
 	empty := fsm.NewEventGraph[orderState, orderEvent]().MustBuild()
 
@@ -200,7 +200,7 @@ func TestEventMachineFire(t *testing.T) {
 	}
 }
 
-// A rejected Fire must leave the machine exactly where it was, and must not prevent a later legal move.
+// A rejected Fire leaves the machine where it was and does not prevent a later allowed move.
 func TestEventMachineFireRejectionIsInert(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustEventMachine(orderGraph(), stateDraft)
@@ -451,7 +451,7 @@ func TestEventMachineGuard(t *testing.T) {
 	})
 }
 
-// A guard is handed the whole transition, not only the state it was registered against.
+// A guard receives the whole transition, not only the state it was registered against.
 func TestEventMachineGuardReceivesTransition(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustEventMachine(orderGraph(), stateDraft)
@@ -472,7 +472,7 @@ func TestEventMachineGuardReceivesTransition(t *testing.T) {
 	}
 }
 
-// The context passed to Fire reaches the guard, so a guard can honor deadlines and request-scoped values.
+// The context passed to Fire reaches the guard, so it can read deadlines and request-scoped values.
 func TestEventMachineGuardReceivesContext(t *testing.T) {
 	type ctxKey string
 
@@ -495,7 +495,7 @@ func TestEventMachineGuardReceivesContext(t *testing.T) {
 	}
 }
 
-// Guards key on the edge (from, event). Two events reaching the same target must not share one.
+// Guards key on the edge (from, event), so two events reaching the same target do not share one.
 func TestEventMachineGuardKeying(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustEventMachine(orderGraph(), stateDraft)
@@ -517,7 +517,7 @@ func TestEventMachineGuardKeying(t *testing.T) {
 	}
 }
 
-// CanFire consults the guard, which is what makes guards a distinct tier from hooks.
+// CanFire calls the guard. Hooks are not called.
 func TestEventMachineCanFireRunsGuard(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustEventMachine(orderGraph(), stateDraft)
@@ -542,7 +542,7 @@ func TestEventMachineCanFireRunsGuard(t *testing.T) {
 	}
 }
 
-// Fire must consult the guard exactly once, not once via its own check and again via CanFire.
+// Fire must call the guard once, not once directly and again through CanFire.
 func TestEventMachineFireRunsGuardOnce(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustEventMachine(orderGraph(), stateDraft)
@@ -586,7 +586,7 @@ func TestEventMachineGuardOverwrite(t *testing.T) {
 
 // --- exit and enter hooks -----------------------------------------------------------------------------------------
 
-// A blocking exit hook aborts before the commit, so nothing moved and the enter hook never ran.
+// A blocking exit hook aborts before the state changes, so nothing moved and the enter hook did not run.
 func TestEventMachineOnExitBlocking(t *testing.T) {
 	ctx := context.Background()
 	held := errors.New("hold not released")
@@ -633,7 +633,7 @@ func TestEventMachineOnExitBlocking(t *testing.T) {
 	}
 }
 
-// A non-blocking exit hook reports its error but does not stop the transition, so the machine DID move.
+// A reporting exit hook returns its error without stopping the transition, so the state changes.
 func TestEventMachineOnExitReporting(t *testing.T) {
 	ctx := context.Background()
 	metrics := errors.New("metrics push failed")
@@ -698,7 +698,7 @@ func TestEventMachineOnEnter(t *testing.T) {
 	}
 }
 
-// OnExit and OnExitBlocking share one slot, so the last registration decides both the function and whether it blocks.
+// OnExit and OnExitBlocking share one slot, so the last registration sets both the function and whether it blocks.
 func TestEventMachineExitHookSlotIsShared(t *testing.T) {
 	ctx := context.Background()
 	boom := errors.New("boom")
@@ -791,7 +791,7 @@ func TestEventMachineOnEnterOverwrite(t *testing.T) {
 	}
 }
 
-// The pipeline runs in one fixed order, and the commit sits between the exit and enter hooks.
+// The stages run in one order, with the state change between the exit and enter hooks.
 func TestEventMachinePipelineOrder(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustEventMachine(orderGraph(), stateDraft)
@@ -829,8 +829,7 @@ func TestEventMachinePipelineOrder(t *testing.T) {
 	}
 }
 
-// A reporting exit hook and a failing enter hook can both produce errors in one call. Both must reach the caller, and
-// the machine did move.
+// A reporting exit hook and a failing enter hook can both produce errors in one call. Both must reach the caller.
 func TestEventMachineBothHooksReportErrors(t *testing.T) {
 	ctx := context.Background()
 	exitErr := errors.New("metrics push failed")
@@ -861,7 +860,7 @@ func TestEventMachineBothHooksReportErrors(t *testing.T) {
 	}
 }
 
-// The invariant from the design: CanFire reports whether a move is permitted, not that it will succeed.
+// CanFire reports that a move is allowed, not that it will succeed.
 func TestEventMachineCanFireDoesNotPromiseSuccess(t *testing.T) {
 	ctx := context.Background()
 
@@ -886,7 +885,7 @@ func TestEventMachineCanFireDoesNotPromiseSuccess(t *testing.T) {
 // --- reentrancy ---------------------------------------------------------------------------------------------------
 
 // A hook that calls back into its own machine is refused from every phase. Without this, a nested call from an exit
-// hook would commit and then be silently overwritten by the outer call's stale target.
+// hook would change the state and then be overwritten by the outer call, which resolved its target earlier.
 func TestEventMachineReentrancy(t *testing.T) {
 	ctx := context.Background()
 
@@ -959,8 +958,8 @@ func TestEventMachineReentrancy(t *testing.T) {
 	}
 }
 
-// After any transition, including one that a guard or a blocking exit hook aborted, the machine must accept a later
-// call. This proves the in-flight flag is cleared on every exit path, not only the successful one.
+// After any transition, including one a guard or a blocking exit hook aborted, the machine must accept a later call.
+// The in-flight flag has to be cleared on every path, not only the successful one.
 func TestEventMachineInFlightClearedOnEveryPath(t *testing.T) {
 	ctx := context.Background()
 	boom := errors.New("boom")
@@ -1017,7 +1016,7 @@ func TestEventMachineInFlightClearedOnEveryPath(t *testing.T) {
 	}
 }
 
-// A hook may safely ask questions of the machine; only moving it is refused.
+// A hook may read the machine. Only moving it is refused.
 func TestEventMachineReadsAreAllowedFromHooks(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustEventMachine(orderGraph(), stateDraft)
@@ -1226,8 +1225,8 @@ func TestMachineTransitionTo(t *testing.T) {
 	}
 }
 
-// A failed resolve on this surface still names both ends. The engine cannot, because it never found an edge, but the
-// caller named the target explicitly so the rewriter can restore it.
+// A failed resolve on this surface still names both ends. The engine cannot, having found no edge, but the caller
+// passed the target and simplify restores it.
 func TestMachineTransitionToNamesBothEnds(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustNew(statusGraph(), stateDraft)
@@ -1378,7 +1377,7 @@ func TestMachineBothHooksFail(t *testing.T) {
 	})
 }
 
-// On this surface a guard keys on the edge from -> to, which is the same key the engine uses.
+// On this surface a guard keys on the edge from -> to, the same key the engine uses.
 func TestMachineGuard(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustNew(statusGraph(), stateDraft)
@@ -1426,7 +1425,7 @@ func TestMachineForceStateAndPredicates(t *testing.T) {
 	assertNoEventVocabulary(t, err)
 }
 
-// Reentrancy is refused on this surface too.
+// Reentrancy is refused on this surface as well.
 func TestMachineReentrancy(t *testing.T) {
 	ctx := context.Background()
 	m := fsm.MustNew(statusGraph(), stateDraft)
@@ -1492,7 +1491,7 @@ func ExampleMachine_OnEnter() {
 	// moved Draft -> Review
 }
 
-// Registering a nil hook is ignored rather than stored and called, so a nil cannot panic mid-transition.
+// A nil hook is ignored rather than stored and called, so it cannot panic during a transition.
 func TestNilHooksAreIgnored(t *testing.T) {
 	ctx := context.Background()
 

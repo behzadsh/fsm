@@ -45,9 +45,9 @@ const (
 //	Review  ------pay-----> Paid        Paid   ---cancel---> Refunded
 //	Paid    -----ship-----> Shipped
 //
-// It deliberately contains three properties the design has to handle: two events reaching the same target (submit and
-// resubmit both land on Review), one event fanning out to different targets from different sources (cancel), and
-// terminal states with no outgoing edges (Shipped, Canceled, Refunded).
+// It covers three shapes the package has to handle: two events reaching the same target (submit and resubmit both
+// land on Review), one event leading to different targets from different sources (cancel), and terminal states with no
+// outgoing edges (Shipped, Canceled, Refunded).
 //
 // Each call returns a freshly built graph, so a test may not affect any other.
 func orderGraph() fsm.EventGraph[orderState, orderEvent] {
@@ -78,8 +78,8 @@ func statusGraph() fsm.Graph[orderState] {
 		MustBuild()
 }
 
-// assertNoEventVocabulary fails when an error produced by the simple, state-only surface mentions events. That surface
-// is implemented on top of the labeled engine, so this is the check that the binding never shows through.
+// assertNoEventVocabulary fails when an error from the simple surface mentions events. That surface runs on the
+// labeled engine, and this checks the binding stays hidden.
 func assertNoEventVocabulary(t *testing.T, err error) {
 	t.Helper()
 

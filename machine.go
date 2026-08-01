@@ -8,7 +8,7 @@ import (
 
 // Transition describes one move: where it started, where it leads, and the event that caused it.
 //
-// It is the value handed to guards and hooks, so they can act on the whole move rather than only on the state they were
+// It is the value passed to guards and hooks, so they see the whole move rather than only the state they were
 // registered against.
 //
 // Example:
@@ -40,11 +40,10 @@ func (t Transition[S, E]) failure(phase Phase, committed bool, err error) *Trans
 	}
 }
 
-// Hook is a guard or a lifecycle callback. It receives the whole transition, so it can act on the move rather than only
-// on the state it was registered against.
+// Hook is a guard or a lifecycle callback.
 //
-// A guard must not have side effects, because CanFire consults it speculatively without the move happening. Exit and
-// enter hooks may do real work, including I/O; they run only for a transition that is actually taking place.
+// A guard must not have side effects, because CanFire calls it without moving the machine. Exit and enter hooks may do
+// real work, including I/O, and run only for a transition that is taking place.
 //
 // Example:
 //
@@ -53,7 +52,7 @@ func (t Transition[S, E]) failure(phase Phase, committed bool, err error) *Trans
 //	}
 type Hook[S ~string, E ~string] func(context.Context, Transition[S, E]) error
 
-// exitHook is the single exit slot for a state: the function, and whether its error aborts the transition.
+// exitHook is the exit slot for a state: the function, and whether its error aborts the transition.
 type exitHook[S ~string, E ~string] struct {
 	fn     Hook[S, E]
 	blocks bool
@@ -61,9 +60,8 @@ type exitHook[S ~string, E ~string] struct {
 
 // EventMachine holds one current state and applies only the transitions its graph declares.
 //
-// It is not safe for concurrent use and holds no lock. Hooks perform real work, often I/O, so an internal mutex would
-// be held across that work and would serialize every goroutine touching the machine. Callers synchronize instead, at
-// the level where their own data already needs it.
+// It holds no lock and is not safe for concurrent use. Hooks perform real work, often I/O, and an internal mutex would
+// be held across it. Callers synchronize instead.
 //
 // Build one with NewEventMachine or MustEventMachine.
 //
@@ -75,22 +73,21 @@ type EventMachine[S ~string, E ~string] struct {
 	graph   EventGraph[S, E]
 	current S
 
-	// guards is keyed by edge, so two events reaching the same target stay independent.
+	// guards is keyed by edge, so two events reaching the same target keep separate guards.
 	guards map[S]map[E]Hook[S, E]
 
 	// onExit and onEnter hold at most one hook per state; registering again replaces the previous one.
 	onExit  map[S]exitHook[S, E]
 	onEnter map[S]Hook[S, E]
 
-	// inFlight is set for the duration of a transition, so a hook cannot move the machine from under it.
+	// inFlight is set for the duration of a transition, so a hook cannot move the machine while one is running.
 	inFlight bool
 }
 
 // NewEventMachine returns a machine positioned at initial, or ErrUnknownState if the graph never names that state.
 //
-// Construction is the boundary where a state read from storage enters the program, and a state that drifted out of the
-// graph would otherwise produce a machine that silently rejects every transition. Validating here turns that into an
-// error at the point the bad value arrives.
+// Construction is where a state read from storage enters the program. Without this check, a state that has drifted out
+// of the graph produces a machine that rejects every transition, with nothing to say why.
 //
 // Example:
 //
@@ -114,8 +111,8 @@ func NewEventMachine[S, E ~string](graph EventGraph[S, E], initial S) (*EventMac
 
 // MustEventMachine returns a machine positioned at initial and panics if the graph never names that state.
 //
-// Use it where the initial state is a compile-time constant and a failure would be a programmer mistake rather than bad
-// data. Prefer NewEventMachine when the state came from storage or a request.
+// Use it where the initial state is a constant and a failure would be a programmer mistake. Prefer NewEventMachine
+// when the state came from storage or a request.
 //
 // Example:
 //
@@ -141,7 +138,7 @@ func (m *EventMachine[S, E]) Current() S {
 
 // Is reports whether the machine is in state.
 //
-// The comparison does not consult the graph, so it works for any value of S.
+// The comparison does not consult the graph, so any value of S may be passed.
 //
 // Example:
 //
@@ -164,11 +161,11 @@ func (m *EventMachine[S, E]) String() string {
 
 // Guard registers a predicate on the single edge (from, event).
 //
-// The guard decides whether the move is permitted. It runs before anything with a side effect, so refusing it leaves
-// the machine untouched, and it is the only thing that can block a transition that CanFire approved.
+// The guard reports whether the move is allowed. It runs before anything with a side effect, so a refusal leaves the
+// machine untouched.
 //
-// It must not have side effects: CanFire consults it speculatively, without the move happening. Guards key on the edge,
-// so two events reaching the same target keep separate guards. Registering again replaces the previous guard.
+// It must not have side effects, because CanFire calls it without moving the machine. Guards key on the edge, so two
+// events reaching the same target keep separate guards. Registering again replaces the previous guard.
 //
 // Example:
 //
@@ -190,11 +187,11 @@ func (m *EventMachine[S, E]) Guard(from S, event E, hook Hook[S, E]) *EventMachi
 
 // OnExit registers the hook that runs when the machine leaves state, reporting its error without stopping the move.
 //
-// The transition commits regardless, so the returned error reaches the caller as information: the machine moved, and
-// something alongside it failed. Use OnExitBlocking when the failure should prevent the move instead.
+// The state changes regardless, and the returned error reaches the caller alongside that fact. Use OnExitBlocking when
+// the failure should prevent the move.
 //
-// A state has one exit hook. OnExit and OnExitBlocking share that slot, so whichever is called last decides both the
-// function and whether it blocks. Overwriting is silent.
+// A state has one exit hook, shared with OnExitBlocking. Whichever is called last decides both the function and whether
+// it blocks. Registering again replaces the previous hook.
 //
 // Example:
 //
@@ -209,11 +206,10 @@ func (m *EventMachine[S, E]) OnExit(state S, hook Hook[S, E]) *EventMachine[S, E
 
 // OnExitBlocking registers the hook that runs when the machine leaves state, aborting the transition if it fails.
 //
-// It runs before the commit, so an abort leaves the machine exactly where it was and the enter hook never runs. This is
-// where fallible work belongs when its failure should prevent the move: the transition simply does not happen, and
-// there is nothing to undo.
+// It runs before the state changes, so an abort leaves the machine where it was and the enter hook does not run. Work
+// that should prevent a move when it fails belongs here: the transition does not happen, leaving nothing to undo.
 //
-// A state has one exit hook, shared with OnExit; see OnExit for the overwrite rule.
+// A state has one exit hook, shared with OnExit. See OnExit for the replacement rule.
 //
 // Example:
 //
@@ -228,11 +224,11 @@ func (m *EventMachine[S, E]) OnExitBlocking(state S, hook Hook[S, E]) *EventMach
 
 // OnEnter registers the hook that runs once the machine has entered state.
 //
-// It runs after the commit, so it cannot stop the transition. Its error is reported to the caller, and Moved on that
-// error returns true: the move happened, and only the follow-up failed. Blocking here is not offered, because undoing a
-// committed transition would mean reverting a state change whose exit hook already took effect in the outside world.
+// It runs after the state has changed and cannot stop the transition. Its error is reported to the caller, and Moved
+// on that error returns true. Blocking is not offered here: undoing the transition would mean reverting a state change
+// whose exit hook has already taken effect outside the machine.
 //
-// A state has one enter hook; registering again replaces it, silently.
+// A state has one enter hook. Registering again replaces it.
 //
 // Example:
 //
@@ -247,8 +243,8 @@ func (m *EventMachine[S, E]) OnEnter(state S, hook Hook[S, E]) *EventMachine[S, 
 
 // CanFire reports whether firing event is permitted from the current state, returning nil when it is.
 //
-// It checks that the edge exists and asks the guard registered on it, and never moves the machine. It reports whether
-// the move is permitted, not that it will succeed: a blocking exit hook can still abort a transition CanFire approved.
+// It checks that the edge exists and calls the guard registered on it, without moving the machine. It reports that the
+// move is allowed, not that it will succeed: a blocking exit hook can still abort it.
 //
 // Example:
 //
@@ -266,16 +262,14 @@ func (m *EventMachine[S, E]) CanFire(ctx context.Context, event E) error {
 
 // Fire moves the machine along the edge that event declares from the current state.
 //
-// The stages run in a fixed order: the edge is resolved, the guard is consulted, the exit hook runs, the state changes,
-// and the enter hook runs. Failing to resolve, a refusing guard, and a blocking exit hook each leave the machine where
-// it was. Errors from a reporting exit hook and from the enter hook are joined and returned after the move has taken
-// effect.
+// The stages run in order: the edge is resolved, the guard is called, the exit hook runs, the state changes, and the
+// enter hook runs. A failed resolve, a refusing guard, and a blocking exit hook each leave the machine where it was.
+// Errors from a reporting exit hook and from the enter hook are joined and returned after the state has changed.
 //
-// Reading the returned error with errors.As gives a TransitionError whose Moved reports whether the state changed,
-// which is what decides if retrying is safe.
+// Reading the returned error with errors.As gives a TransitionError whose Moved reports whether the state changed.
 //
-// Calling Fire from inside a hook returns ErrReentrant and does nothing: the outer transition already holds the
-// machine, and a nested commit would be silently overwritten when it resumes.
+// Calling Fire from inside a hook returns ErrReentrant and does nothing. The outer transition resolved its edge before
+// the hook ran, and would overwrite a nested change when it resumes.
 //
 // Example:
 //
@@ -327,11 +321,11 @@ func (m *EventMachine[S, E]) Fire(ctx context.Context, event E) error {
 
 // ForceState sets the current state directly, ignoring the graph.
 //
-// No edge is required, no guard is consulted, and no hook runs. This is a deliberate hole in every guarantee the rest
-// of the package provides, and it exists for operational repair: support tooling, data migrations, and unsticking an
-// entity a bug stranded. It is not for ordinary application code, where a declared transition is always the answer.
+// No edge is required, no guard is called, and no hook runs, which sets aside every guarantee the rest of the package
+// provides. It is meant for operational repair: support tooling, data migrations, and freeing an entity a bug stranded.
+// Ordinary application code should declare the transition instead.
 //
-// The only check is that the graph names the state, so a typo cannot invent one.
+// The one check is that the graph names the state, so a typo cannot invent one.
 //
 // Example:
 //
@@ -382,8 +376,7 @@ func (m *EventMachine[S, E]) runGuard(ctx context.Context, transition Transition
 
 // Change describes one move on the simple surface: the state left and the state entered.
 //
-// It is what guards and hooks receive there. Unlike Transition it carries no event, because the simple surface has
-// none.
+// It is what guards and hooks receive there. Unlike Transition it carries no event, since that surface has none.
 //
 // Example:
 //
@@ -401,8 +394,8 @@ type Change[S ~string] struct {
 
 // StateHook is a guard or a lifecycle callback on the simple surface.
 //
-// The rules match Hook: a guard must not have side effects, because CanTransitionTo consults it without the move
-// happening, while exit and enter hooks may do real work and run only for a transition that is taking place.
+// The rules match Hook: a guard must not have side effects, because CanTransitionTo calls it without moving the
+// machine, while exit and enter hooks may do real work and run only for a transition that is taking place.
 //
 // Example:
 //
@@ -413,11 +406,10 @@ type StateHook[S ~string] func(context.Context, Change[S]) error
 
 // Machine holds one current state and applies only the transitions its graph declares, naming them by destination.
 //
-// This is the simple surface. It is built on the same engine as EventMachine, with each edge's event name bound to its
-// target state, but that binding never surfaces: no type, method, error message, or hook argument here mentions an
-// event.
+// It is built on the same engine as EventMachine, with each edge's event name bound to its target state. That binding
+// does not appear in its types, methods, error messages, or hook arguments.
 //
-// Like EventMachine it is not safe for concurrent use and holds no lock. Build one with New or MustNew.
+// Like EventMachine it holds no lock and is not safe for concurrent use. Build one with New or MustNew.
 //
 // Example:
 //
@@ -429,8 +421,8 @@ type Machine[S ~string] struct {
 
 // New returns a machine positioned at initial, or ErrUnknownState if the graph never names that state.
 //
-// As with NewEventMachine, construction is the boundary where a state read from storage enters the program, which is
-// why it is validated here.
+// As with NewEventMachine, the check matters because construction is where a state read from storage enters the
+// program.
 //
 // Example:
 //
@@ -449,7 +441,7 @@ func New[S ~string](graph Graph[S], initial S) (*Machine[S], error) {
 
 // MustNew returns a machine positioned at initial and panics if the graph never names that state.
 //
-// Use it where the initial state is a compile-time constant; prefer New when the state came from storage or a request.
+// Use it where the initial state is a constant. Prefer New when the state came from storage or a request.
 //
 // Example:
 //
@@ -496,7 +488,7 @@ func (m *Machine[S]) String() string {
 
 // Guard registers a predicate on the single edge from -> to.
 //
-// It must not have side effects, because CanTransitionTo consults it without the move happening. Registering again
+// It must not have side effects, because CanTransitionTo calls it without moving the machine. Registering again
 // replaces the previous guard.
 //
 // Example:
@@ -515,8 +507,8 @@ func (m *Machine[S]) Guard(from, to S, hook StateHook[S]) *Machine[S] {
 
 // OnExit registers the hook that runs when the machine leaves state, reporting its error without stopping the move.
 //
-// A state has one exit hook, shared with OnExitBlocking; whichever is called last decides both the function and
-// whether it blocks. Overwriting is silent.
+// A state has one exit hook, shared with OnExitBlocking. Whichever is called last decides both the function and
+// whether it blocks. Registering again replaces the previous hook.
 //
 // Example:
 //
@@ -531,7 +523,7 @@ func (m *Machine[S]) OnExit(state S, hook StateHook[S]) *Machine[S] {
 
 // OnExitBlocking registers the hook that runs when the machine leaves state, aborting the transition if it fails.
 //
-// It runs before the state changes, so an abort leaves the machine where it was and the enter hook never runs.
+// It runs before the state changes, so an abort leaves the machine where it was and the enter hook does not run.
 //
 // Example:
 //
@@ -546,7 +538,7 @@ func (m *Machine[S]) OnExitBlocking(state S, hook StateHook[S]) *Machine[S] {
 
 // OnEnter registers the hook that runs once the machine has entered state.
 //
-// It runs after the state has changed and cannot stop the transition; its error is reported to the caller.
+// It runs after the state has changed and cannot stop the transition. Its error is reported to the caller.
 //
 // Example:
 //
@@ -561,8 +553,8 @@ func (m *Machine[S]) OnEnter(state S, hook StateHook[S]) *Machine[S] {
 
 // CanTransitionTo reports whether moving to the given state is permitted, returning nil when it is.
 //
-// It checks that the edge exists and asks the guard registered on it, and never moves the machine. It reports whether
-// the move is permitted, not that it will succeed: a blocking exit hook can still abort a move this approved.
+// It checks that the edge exists and calls the guard registered on it, without moving the machine. It reports that the
+// move is allowed, not that it will succeed: a blocking exit hook can still abort it.
 //
 // Example:
 //
@@ -575,8 +567,8 @@ func (m *Machine[S]) CanTransitionTo(ctx context.Context, to S) error {
 
 // TransitionTo moves the machine to the given state, if the graph declares an edge leading there.
 //
-// The stages run in the same fixed order as on the labeled surface: the edge is resolved, the guard is consulted, the
-// exit hook runs, the state changes, and the enter hook runs. Calling it from inside a hook returns ErrReentrant.
+// The stages run in the same order as on the labeled surface: the edge is resolved, the guard is called, the exit hook
+// runs, the state changes, and the enter hook runs. Calling it from inside a hook returns ErrReentrant.
 //
 // Example:
 //
@@ -589,8 +581,8 @@ func (m *Machine[S]) TransitionTo(ctx context.Context, to S) error {
 
 // ForceState sets the current state directly, ignoring the graph.
 //
-// No edge is required, no guard is consulted, and no hook runs. As on the labeled surface it exists for operational
-// repair, not for ordinary application code, and checks only that the graph names the state.
+// No edge is required, no guard is called, and no hook runs. As on the labeled surface it is meant for operational
+// repair, and its one check is that the graph names the state.
 //
 // Example:
 //

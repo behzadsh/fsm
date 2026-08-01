@@ -12,13 +12,13 @@ func TestEventGraphString(t *testing.T) {
 	got := orderGraph().String()
 
 	want := strings.Join([]string{
-		"Draft --cancel--> Canceled",
-		"Draft --resubmit--> Review",
-		"Draft --submit--> Review",
-		"Paid --cancel--> Refunded",
-		"Paid --ship--> Shipped",
-		"Review --cancel--> Canceled",
-		"Review --pay--> Paid",
+		"Draft ---cancel---> Canceled",
+		"Draft ---resubmit---> Review",
+		"Draft ---submit---> Review",
+		"Paid ---cancel---> Refunded",
+		"Paid ---ship---> Shipped",
+		"Review ---cancel---> Canceled",
+		"Review ---pay---> Paid",
 	}, "\n")
 
 	if got != want {
@@ -80,8 +80,8 @@ func TestGraphMermaid(t *testing.T) {
 	}
 }
 
-// Map iteration order is randomized per range in Go, so rendering the same graph repeatedly is the check that the
-// output is sorted rather than accidentally stable.
+// Go randomizes map iteration order per range, so rendering the same graph repeatedly checks that the output is
+// sorted rather than stable by accident.
 func TestRenderersAreDeterministic(t *testing.T) {
 	event := orderGraph()
 	state := statusGraph()
@@ -106,8 +106,8 @@ func TestRenderersAreDeterministic(t *testing.T) {
 	}
 }
 
-// The simple surface must not leak the event names it uses internally, and every edge's event name there is its target
-// state, so a leak would show up as a duplicated state name on the line.
+// Every edge's event name on the simple surface is its target state, so an event name reaching the output would show
+// up as a duplicated state on the line.
 func TestSimpleRenderersEmitNoEventLabels(t *testing.T) {
 	for name, got := range map[string]string{
 		"String":  statusGraph().String(),
@@ -151,10 +151,10 @@ func TestRenderEmptyGraph(t *testing.T) {
 	})
 }
 
-// Both graph types satisfy fmt.Stringer, so a graph renders itself in a log line or a test failure.
+// Both graph types satisfy fmt.Stringer.
 func TestGraphsSatisfyStringer(t *testing.T) {
 	var event fmt.Stringer = orderGraph()
-	if !strings.Contains(event.String(), "--submit-->") {
+	if !strings.Contains(event.String(), "---submit--->") {
 		t.Errorf("EventGraph as fmt.Stringer = %q", event.String())
 	}
 

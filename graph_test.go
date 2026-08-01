@@ -105,7 +105,7 @@ func TestEventGraphBuilderOn(t *testing.T) {
 }
 
 // Two events reaching the same target must both survive the build. Keying edges by target instead of by event would
-// silently collapse them, which is why this is asserted on its own rather than only as a row in the table above.
+// collapse them into one.
 func TestEventGraphTwoEventsSameTarget(t *testing.T) {
 	g := fsm.NewEventGraph[orderState, orderEvent]().
 		On(stateDraft, eventSubmit, stateReview).
@@ -151,8 +151,8 @@ func TestEventGraphBuilderDuplicateEdge(t *testing.T) {
 			On(stateDraft, eventSubmit, stateReview).
 			On(stateDraft, eventSubmit, statePaid)
 
-		// Build reports the error, but the partially assembled graph must not have taken the second target, or
-		// "last write wins" would be the silent behavior the error exists to prevent.
+		// Build reports the error, and the partially assembled graph keeps the first target. Taking the second
+		// would make the conflict a silent overwrite.
 		g, err := b.Build()
 		if err == nil {
 			t.Fatal("Build() returned nil error, want a duplicate-edge error")
@@ -233,8 +233,7 @@ func TestEventGraphBuilderMustBuild(t *testing.T) {
 	})
 }
 
-// A built graph is sealed: later use of the builder that produced it must not change what the graph allows. The old
-// implementation stored the caller's map by reference, so this is the contract that replaces that documented footgun.
+// Later use of the builder that produced a graph must not change what the graph allows.
 func TestEventGraphSealedAfterBuild(t *testing.T) {
 	b := fsm.NewEventGraph[orderState, orderEvent]().
 		On(stateDraft, eventSubmit, stateReview)
@@ -290,7 +289,7 @@ func ExampleNewEventGraph() {
 }
 
 func ExampleEventGraphBuilder_Build() {
-	// Build returns the error instead of panicking, which is what conditional construction needs.
+	// Build returns the error instead of panicking, for conditional construction.
 	builder := fsm.NewEventGraph[orderState, orderEvent]().
 		On(stateDraft, eventSubmit, stateReview)
 

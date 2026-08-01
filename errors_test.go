@@ -30,8 +30,7 @@ func TestPhaseString(t *testing.T) {
 	}
 }
 
-// PhaseResolve must be the zero value, so a TransitionError built without an explicit phase reports the earliest
-// stage rather than an arbitrary one.
+// PhaseResolve must be the zero value, so a TransitionError built without an explicit phase reports the first stage.
 func TestPhaseZeroValue(t *testing.T) {
 	var p fsm.Phase
 
@@ -149,9 +148,8 @@ func TestTransitionErrorUnwrap(t *testing.T) {
 	})
 }
 
-// Moved draws the commit boundary that decides whether retrying is safe. It reports Committed rather than deriving the
-// answer from Phase, because PhaseExit is ambiguous: a blocking exit hook aborts before the commit, while a reporting
-// one lets the transition through and only carries its error alongside.
+// Moved reports Committed rather than deriving the answer from Phase, because PhaseExit covers two cases: a blocking
+// exit hook aborts before the state changes, while a reporting one lets the transition through.
 func TestTransitionErrorMoved(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -183,7 +181,7 @@ func TestTransitionErrorMoved(t *testing.T) {
 	}
 }
 
-// The two PhaseExit rows above are the whole reason Moved reads a field: the phase alone cannot separate them.
+// The two PhaseExit rows above are why Moved reads a field: the phase alone does not separate them.
 func TestTransitionErrorMovedPhaseExitIsAmbiguous(t *testing.T) {
 	base := func(committed bool) *fsm.TransitionError[orderState, orderEvent] {
 		return &fsm.TransitionError[orderState, orderEvent]{
@@ -205,7 +203,7 @@ func TestTransitionErrorMovedPhaseExitIsAmbiguous(t *testing.T) {
 	}
 }
 
-// The three sentinels must be distinct, or a caller switching on them would match the wrong one.
+// The three sentinels must be distinct, or a caller matching one would match another.
 func TestSentinelsAreDistinct(t *testing.T) {
 	sentinels := map[string]error{
 		"ErrInvalidTransition": fsm.ErrInvalidTransition,
@@ -227,7 +225,7 @@ func TestSentinelsAreDistinct(t *testing.T) {
 }
 
 func ExamplePhase() {
-	// Phase answers the only question a caller has after a failure: did anything happen?
+	// Phase reports how far a failed transition got.
 	fmt.Println(fsm.PhaseResolve, fsm.PhaseGuard, fsm.PhaseExit, fsm.PhaseEnter)
 
 	// Output:

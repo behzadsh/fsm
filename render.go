@@ -5,12 +5,12 @@ import (
 	"strings"
 )
 
-// mermaidHeader opens a Mermaid state diagram. Rendering it even for an empty graph keeps the output valid Mermaid.
+// mermaidHeader opens a Mermaid state diagram. It is rendered even for an empty graph, so the output is always valid.
 const mermaidHeader = "stateDiagram-v2"
 
 // String renders the graph as one edge per line, so EventGraph satisfies fmt.Stringer.
 //
-// Edges are sorted by source state and then by event, so the output is stable across calls and suitable for a golden
+// Edges are sorted by source state and then by event, so the output is stable across calls and usable as a golden
 // file. An empty graph renders as the empty string.
 //
 // Example:
@@ -38,8 +38,7 @@ func (g EventGraph[S, E]) String() string {
 
 // Mermaid renders the graph as a Mermaid state diagram, with each event as the edge label.
 //
-// The output is sorted like String's and pastes directly into Markdown that supports Mermaid, which is what makes a
-// builder-declared graph reviewable at a glance.
+// The output is sorted like String's and pastes into Markdown that supports Mermaid.
 //
 // Example:
 //
@@ -64,7 +63,7 @@ func (g EventGraph[S, E]) Mermaid() string {
 
 // sortedStates returns every state that has at least one outgoing edge, in order.
 //
-// Map iteration order is randomized, so every renderer walks this instead of ranging the map directly.
+// Map iteration order is randomized, so renderers walk this instead of ranging the map directly.
 func (g EventGraph[S, E]) sortedStates() []S {
 	states := make([]S, 0, len(g.edges))
 	for from := range g.edges {
@@ -92,8 +91,8 @@ func (g EventGraph[S, E]) sortedEvents(from S) []E {
 
 // String renders the graph as one edge per line, so Graph satisfies fmt.Stringer.
 //
-// No event names appear, because this surface has none. Edges are sorted by source and then by target, so the output
-// is stable across calls. An empty graph renders as the empty string.
+// No event names appear, since this surface has none. Edges are sorted by source and then by target, so the output is
+// stable across calls. An empty graph renders as the empty string.
 //
 // Example:
 //

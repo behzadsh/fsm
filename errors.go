@@ -5,8 +5,8 @@ import (
 	"fmt"
 )
 
-// Sentinel errors reported by this package. Match them with errors.Is; they are wrapped rather than returned directly,
-// so the caller also gets the structured detail carried by TransitionError.
+// Sentinel errors reported by this package. They are wrapped rather than returned directly, so a caller matching them
+// with errors.Is still receives the detail TransitionError carries.
 //
 // Example:
 //
@@ -17,26 +17,23 @@ var (
 	// ErrInvalidTransition reports that the graph declares no edge for the attempted move.
 	ErrInvalidTransition = errors.New("invalid transition")
 
-	// ErrReentrant reports that a hook tried to move the machine that is already mid-transition.
+	// ErrReentrant reports that a hook tried to move the machine it is running inside.
 	ErrReentrant = errors.New("reentrant call from hook")
 
 	// ErrUnknownState reports a state that appears nowhere in the graph.
 	ErrUnknownState = errors.New("unknown state")
 )
 
-// Phase identifies the stage of a transition at which something failed.
+// Phase identifies the stage of a transition at which it failed.
 //
-// It answers the only question a caller has after a failure: did anything actually happen? PhaseResolve and PhaseGuard
-// both mean nothing moved and no side effect ran, so retrying later is safe. PhaseExit means nothing moved but an exit
-// hook may already have had an effect. PhaseEnter means the machine did move and only the follow-up failed, so the
-// caller should log rather than retry.
+// PhaseResolve and PhaseGuard mean nothing moved and nothing ran. PhaseExit means nothing moved, though an exit hook
+// may already have had an effect. PhaseEnter means the state changed and a hook failed afterwards.
 //
-// The zero value is PhaseResolve, the earliest stage. Committing is not a phase, because it is a single assignment
-// that cannot fail; the boundary it draws is reported by TransitionError.Moved instead. Do not infer that boundary
-// from the phase: a non-blocking exit hook fails at PhaseExit and the machine still moves.
+// The zero value is PhaseResolve. Changing the state is not a phase: it is one assignment that cannot fail. Use
+// TransitionError.Moved rather than the phase to tell whether the state changed, since a reporting exit hook fails at
+// PhaseExit and the machine still moves.
 //
-// The numeric values are an implementation detail and may shift if a stage is ever added. Persist and label phases with
-// String, not with uint8(phase).
+// The numeric values may shift if a stage is added. Store and label phases with String, not with uint8(phase).
 //
 // Example:
 //
@@ -56,14 +53,14 @@ const (
 	// PhaseGuard is the guard registered on the resolved edge.
 	PhaseGuard
 
-	// PhaseExit is the hook leaving the source state, which runs before the state changes.
+	// PhaseExit is the hook leaving the source state. It runs before the state changes.
 	PhaseExit
 
-	// PhaseEnter is the hook entering the target state, which runs after the state has changed.
+	// PhaseEnter is the hook entering the target state. It runs after the state has changed.
 	PhaseEnter
 )
 
-// String returns the phase name in lower case, so it reads well both in an error message and as a metrics label.
+// String returns the phase name in lower case, suitable for an error message or a metrics label.
 //
 // Example:
 //
@@ -86,11 +83,10 @@ func (p Phase) String() string {
 
 // TransitionError describes a transition that did not complete, and how far it got.
 //
-// To is the zero value when the failure was a failed resolve, since no edge was found and therefore no destination is
-// known. In every other phase both ends are named.
+// To is the zero value when resolve failed, since no edge was found and no destination is known. In every other phase
+// both ends are named.
 //
-// Retrieve it with errors.As, and read Phase to decide what to do; see Phase for what each value implies about whether
-// the machine moved.
+// Retrieve it with errors.As. Read Moved to tell whether the state changed.
 //
 // Example:
 //
@@ -111,16 +107,16 @@ type TransitionError[S ~string, E ~string] struct {
 	// Phase is the stage at which the transition failed.
 	Phase Phase
 
-	// Committed records whether the machine's state had already changed when this error was produced. It is reported
-	// by Moved, and cannot be derived from Phase alone: a non-blocking exit hook fails at PhaseExit yet does not stop
-	// the transition, so the machine moves anyway.
+	// Committed records whether the state had already changed when this error was produced. Moved reports it. It
+	// cannot be derived from Phase alone, because a reporting exit hook fails at PhaseExit without stopping the
+	// transition.
 	Committed bool
 
 	// Err is the underlying cause, and is what Unwrap returns.
 	Err error
 }
 
-// Error renders the failure, naming a destination only when one was resolved.
+// Error renders the failure, naming a destination only when resolve found one.
 //
 // Example:
 //
@@ -135,7 +131,7 @@ func (e *TransitionError[S, E]) Error() string {
 	return fmt.Sprintf("fsm: %s %s -> %s (event %s): %v", e.Phase, e.From, e.To, e.Event, e.Err)
 }
 
-// Unwrap returns the underlying cause, so errors.Is reaches both this package's sentinels and any error a guard or hook
+// Unwrap returns the underlying cause, so errors.Is reaches this package's sentinels and any error a guard or hook
 // returned.
 //
 // Example:
@@ -145,20 +141,19 @@ func (e *TransitionError[S, E]) Unwrap() error {
 	return e.Err
 }
 
-// Moved reports whether the machine's state actually changed before the failure.
+// Moved reports whether the state changed before the failure.
 //
-// It draws the commit boundary that decides what a caller should do next. False means nothing moved and retrying is
-// safe. True means the transition took effect and only a reported hook failed, so the work must not be retried; log it
-// instead.
+// False means nothing moved and the call can be retried. True means the transition took effect and a reported hook
+// failed afterwards, so retrying would repeat work that already happened.
 //
-// It is not the same question as "which phase failed". A non-blocking exit hook fails at PhaseExit but does not stop
-// the transition, so the machine moves and Moved reports true.
+// This is not the same as which phase failed. A reporting exit hook fails at PhaseExit without stopping the
+// transition, so the state changes and Moved returns true.
 //
 // Example:
 //
 //	var te *fsm.TransitionError[OrderState, OrderEvent]
 //	if errors.As(err, &te) && te.Moved() {
-//		// the order did move; do not retry, or it happens twice
+//		// the order moved; retrying would repeat it
 //	}
 func (e *TransitionError[S, E]) Moved() bool {
 	return e.Committed

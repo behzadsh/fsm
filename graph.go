@@ -7,13 +7,12 @@ import (
 
 // EventGraph declares the states of a machine and the labeled transitions between them.
 //
-// Each edge is identified by the pair (from, event) and resolves to exactly one target state. An event may fan out, so
-// the same event name may lead to different targets from different source states, and several events may reach the same
-// target. A state with no outgoing edge is terminal; terminal states need not be declared, since they are simply
-// targets nothing leaves.
+// Each edge is identified by the pair (from, event) and leads to exactly one target state. The same event name may
+// lead to different targets from different source states, and several events may reach the same target. A state with
+// no outgoing edge is terminal and need not be declared, since it is a target nothing leaves.
 //
-// The zero value is an empty graph that permits no transition. Build one with NewEventGraph. A built graph is sealed:
-// it holds its own copy of the edges, so later use of the builder that produced it cannot change what it allows.
+// The zero value is an empty graph that allows no transition. Build one with NewEventGraph. A built graph holds its own
+// copy of the edges, so later use of the builder that produced it does not change what the graph allows.
 //
 // Example:
 //
@@ -44,9 +43,9 @@ func (g EventGraph[S, E]) target(from S, event E) (S, bool) {
 
 // NewEventGraph returns an empty builder for a graph whose states are of type S and whose events are of type E.
 //
-// Both type parameters are constrained to ~string, so callers declare their own named string types. That keeps one
-// machine's states from being accepted by another, while error messages stay readable and stored values round-trip
-// without conversion.
+// Both type parameters are constrained to ~string, so callers declare their own named string types. The compiler then
+// rejects one machine's states where another's are expected, error messages stay readable, and stored values need no
+// conversion.
 //
 // Example:
 //
@@ -60,8 +59,8 @@ func NewEventGraph[S, E ~string]() *EventGraphBuilder[S, E] {
 
 // EventGraphBuilder accumulates edges and the conflicts found while declaring them.
 //
-// Every method returns the builder, so declarations chain. Conflicts are not reported as they happen; they are
-// collected and surfaced together by Build or MustBuild.
+// Every method returns the builder, so declarations chain. Conflicts are collected as they are found and reported
+// together by Build or MustBuild.
 //
 // Example:
 //
@@ -75,9 +74,8 @@ type EventGraphBuilder[S ~string, E ~string] struct {
 
 // On declares that firing event while in from moves the machine to.
 //
-// Declaring the pair (from, event) more than once is a conflict, recorded and reported by Build or MustBuild. The first
-// declaration wins, so a conflicting later one never silently replaces an earlier edge. Re-declaring an identical edge
-// is a conflict too: it is a copy-paste mistake rather than an intent to change anything.
+// Declaring the pair (from, event) more than once is a conflict, reported by Build or MustBuild. The first declaration
+// wins, so a later one does not silently replace an earlier edge. Re-declaring an identical edge is a conflict as well.
 //
 // Example:
 //
@@ -101,12 +99,10 @@ func (b *EventGraphBuilder[S, E]) On(from S, event E, to S) *EventGraphBuilder[S
 
 // Build returns the declared graph, or every conflict found while declaring it.
 //
-// Conflicts are joined with errors.Join, so a graph with several mistakes reports all of them at once rather than one
-// per attempt. Use Build when the graph is assembled conditionally and the error has somewhere to go; use MustBuild for
-// a package-level variable.
+// Conflicts are joined with errors.Join, so a graph with several mistakes reports all of them at once. Use Build when
+// the graph is assembled conditionally and the error has somewhere to go; use MustBuild for a package-level variable.
 //
-// The graph is returned even when the error is non-nil, holding the edges declared before each conflict. That makes the
-// first-declaration-wins rule observable rather than theoretical.
+// The graph is returned even when the error is non-nil, holding the edges declared before each conflict.
 //
 // Example:
 //
@@ -140,9 +136,9 @@ func (b *EventGraphBuilder[S, E]) Build() (EventGraph[S, E], error) {
 
 // MustBuild returns the declared graph and panics if any conflict was found.
 //
-// A graph is static configuration built once at start-up, so a conflict is a programmer mistake that should surface
-// immediately and loudly rather than being handled. This is the regexp.MustCompile pattern, and it is what a
-// package-level variable needs, since a variable initializer cannot handle an error.
+// A graph is static configuration built once at start-up, so a conflict is a programmer mistake rather than a runtime
+// condition. This is the regexp.MustCompile pattern, and it is what a package-level variable needs, since a variable
+// initializer cannot handle an error.
 //
 // Example:
 //
@@ -160,12 +156,11 @@ func (b *EventGraphBuilder[S, E]) MustBuild() EventGraph[S, E] {
 
 // Graph declares the states of a machine and the transitions between them, without naming the transitions.
 //
-// This is the simple surface. An edge is identified by the pair (from, to), and a machine moves by naming its
-// destination. Use EventGraph instead when one action must lead to different targets depending on where the machine
-// is, since expressing that requires naming the action.
+// An edge is identified by the pair (from, to), and a machine moves by naming its destination. Use EventGraph when one
+// action must lead to different targets depending on where the machine is, which naming the destination cannot express.
 //
-// The zero value is an empty graph that permits no transition. Build one with NewGraph. A built graph is sealed, and
-// holds its own copy of the edges.
+// The zero value is an empty graph that allows no transition. Build one with NewGraph. A built graph holds its own copy
+// of the edges.
 //
 // Example:
 //
@@ -208,9 +203,9 @@ type GraphBuilder[S ~string] struct {
 
 // To declares that the machine may move from from to each of the given targets.
 //
-// It is variadic because one state usually leads to several, and reads as a row of a transition table. Declaring the
-// same pair (from, to) more than once is a conflict, reported by Build or MustBuild; calling To with no targets
-// declares nothing at all.
+// It is variadic so that one call declares every edge leaving a state, reading as a row of a transition table.
+// Declaring the same pair (from, to) more than once is a conflict, reported by Build or MustBuild. Calling To with no
+// targets declares nothing.
 //
 // Example:
 //
@@ -229,8 +224,8 @@ func (b *GraphBuilder[S]) To(from S, to ...S) *GraphBuilder[S] {
 
 		b.seen[from][target] = struct{}{}
 
-		// Each edge is stored with its target state as the event name, which is what lets the simple surface reuse
-		// the labeled engine unchanged. Nothing outside this package can observe the binding.
+		// Each edge is stored with its target state as the event name, which lets the simple surface reuse the
+		// labeled engine unchanged. The binding is not observable outside this package.
 		b.inner.On(from, target, target)
 	}
 
