@@ -149,34 +149,59 @@ func TestTransitionErrorUnwrap(t *testing.T) {
 	})
 }
 
-// Moved draws the commit boundary: everything before PhaseEnter left the machine where it was, and only PhaseEnter
-// means the state actually changed. This is the distinction that decides whether retrying is safe.
+// Moved draws the commit boundary that decides whether retrying is safe. It reports Committed rather than deriving the
+// answer from Phase, because PhaseExit is ambiguous: a blocking exit hook aborts before the commit, while a reporting
+// one lets the transition through and only carries its error alongside.
 func TestTransitionErrorMoved(t *testing.T) {
 	tests := []struct {
-		name  string
-		phase fsm.Phase
-		want  bool
+		name      string
+		phase     fsm.Phase
+		committed bool
 	}{
 		{"resolve found no edge, so nothing moved", fsm.PhaseResolve, false},
 		{"a guard refused before anything ran", fsm.PhaseGuard, false},
-		{"an exit hook aborted before the commit", fsm.PhaseExit, false},
+		{"a blocking exit hook aborted before the commit", fsm.PhaseExit, false},
+		{"a reporting exit hook failed but the move went through", fsm.PhaseExit, true},
 		{"an enter hook failed after the commit", fsm.PhaseEnter, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			err := &fsm.TransitionError[orderState, orderEvent]{
-				From:  statePaid,
-				To:    stateShipped,
-				Event: eventShip,
-				Phase: tt.phase,
-				Err:   errors.New("boom"),
+				From:      statePaid,
+				To:        stateShipped,
+				Event:     eventShip,
+				Phase:     tt.phase,
+				Committed: tt.committed,
+				Err:       errors.New("boom"),
 			}
 
-			if got := err.Moved(); got != tt.want {
-				t.Errorf("Moved() with %v = %v, want %v", tt.phase, got, tt.want)
+			if got := err.Moved(); got != tt.committed {
+				t.Errorf("Moved() with %v = %v, want %v", tt.phase, got, tt.committed)
 			}
 		})
+	}
+}
+
+// The two PhaseExit rows above are the whole reason Moved reads a field: the phase alone cannot separate them.
+func TestTransitionErrorMovedPhaseExitIsAmbiguous(t *testing.T) {
+	base := func(committed bool) *fsm.TransitionError[orderState, orderEvent] {
+		return &fsm.TransitionError[orderState, orderEvent]{
+			From:      statePaid,
+			To:        stateShipped,
+			Event:     eventShip,
+			Phase:     fsm.PhaseExit,
+			Committed: committed,
+			Err:       errors.New("boom"),
+		}
+	}
+
+	if base(false).Moved() {
+		t.Error("a blocking exit abort reports Moved() = true, want false")
+	}
+
+	if !base(true).Moved() {
+		t.Error("a reporting exit failure reports Moved() = false, want true")
 	}
 }
 

@@ -32,7 +32,8 @@ var (
 // caller should log rather than retry.
 //
 // The zero value is PhaseResolve, the earliest stage. Committing is not a phase, because it is a single assignment
-// that cannot fail; the boundary it draws is reported by TransitionError.Moved instead.
+// that cannot fail; the boundary it draws is reported by TransitionError.Moved instead. Do not infer that boundary
+// from the phase: a non-blocking exit hook fails at PhaseExit and the machine still moves.
 //
 // The numeric values are an implementation detail and may shift if a stage is ever added. Persist and label phases with
 // String, not with uint8(phase).
@@ -110,6 +111,11 @@ type TransitionError[S ~string, E ~string] struct {
 	// Phase is the stage at which the transition failed.
 	Phase Phase
 
+	// Committed records whether the machine's state had already changed when this error was produced. It is reported
+	// by Moved, and cannot be derived from Phase alone: a non-blocking exit hook fails at PhaseExit yet does not stop
+	// the transition, so the machine moves anyway.
+	Committed bool
+
 	// Err is the underlying cause, and is what Unwrap returns.
 	Err error
 }
@@ -142,8 +148,11 @@ func (e *TransitionError[S, E]) Unwrap() error {
 // Moved reports whether the machine's state actually changed before the failure.
 //
 // It draws the commit boundary that decides what a caller should do next. False means nothing moved and retrying is
-// safe. True means the transition succeeded and only a post-commit hook failed, so the work must not be retried; log it
+// safe. True means the transition took effect and only a reported hook failed, so the work must not be retried; log it
 // instead.
+//
+// It is not the same question as "which phase failed". A non-blocking exit hook fails at PhaseExit but does not stop
+// the transition, so the machine moves and Moved reports true.
 //
 // Example:
 //
@@ -152,5 +161,5 @@ func (e *TransitionError[S, E]) Unwrap() error {
 //		// the order did move; do not retry, or it happens twice
 //	}
 func (e *TransitionError[S, E]) Moved() bool {
-	return e.Phase == PhaseEnter
+	return e.Committed
 }

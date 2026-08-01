@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/behzadsh/fsm"
@@ -393,4 +394,695 @@ func ExampleEventMachine_ForceState() {
 	// Output:
 	// Draft
 	// fsm: force state Unknown: unknown state
+}
+
+// --- guards -------------------------------------------------------------------------------------------------------
+
+func TestEventMachineGuard(t *testing.T) {
+	ctx := context.Background()
+	denied := errors.New("not authorized")
+
+	t.Run("a passing guard lets the transition through", func(t *testing.T) {
+		m := fsm.MustEventMachine(orderGraph(), stateDraft)
+		m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			return nil
+		})
+
+		if err := m.Fire(ctx, eventSubmit); err != nil {
+			t.Fatalf("Fire returned error: %v", err)
+		}
+
+		if got := m.Current(); got != stateReview {
+			t.Errorf("Current() = %q, want %q", got, stateReview)
+		}
+	})
+
+	t.Run("a refusing guard blocks it and nothing moves", func(t *testing.T) {
+		m := fsm.MustEventMachine(orderGraph(), stateDraft)
+		m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			return denied
+		})
+
+		err := m.Fire(ctx, eventSubmit)
+		if err == nil {
+			t.Fatal("Fire returned nil error, want the guard's refusal")
+		}
+
+		if !errors.Is(err, denied) {
+			t.Errorf("err = %v, want it to wrap the guard's error", err)
+		}
+
+		var te *fsm.TransitionError[orderState, orderEvent]
+		if !errors.As(err, &te) {
+			t.Fatalf("err is %T, want *fsm.TransitionError", err)
+		}
+
+		if te.Phase != fsm.PhaseGuard {
+			t.Errorf("Phase = %v, want PhaseGuard", te.Phase)
+		}
+
+		if te.Moved() {
+			t.Error("Moved() = true, want false; a guard refuses before the commit")
+		}
+
+		if got := m.Current(); got != stateDraft {
+			t.Errorf("Current() = %q, want %q", got, stateDraft)
+		}
+	})
+}
+
+// A guard is handed the whole transition, not only the state it was registered against.
+func TestEventMachineGuardReceivesTransition(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	var seen fsm.Transition[orderState, orderEvent]
+	m.Guard(stateDraft, eventSubmit, func(_ context.Context, tr fsm.Transition[orderState, orderEvent]) error {
+		seen = tr
+
+		return nil
+	})
+
+	if err := m.Fire(ctx, eventSubmit); err != nil {
+		t.Fatalf("Fire returned error: %v", err)
+	}
+
+	if seen.From != stateDraft || seen.To != stateReview || seen.Event != eventSubmit {
+		t.Errorf("guard saw %+v, want Draft -> Review via submit", seen)
+	}
+}
+
+// The context passed to Fire reaches the guard, so a guard can honor deadlines and request-scoped values.
+func TestEventMachineGuardReceivesContext(t *testing.T) {
+	type ctxKey string
+
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	var got any
+	m.Guard(stateDraft, eventSubmit, func(c context.Context, _ fsm.Transition[orderState, orderEvent]) error {
+		got = c.Value(ctxKey("k"))
+
+		return nil
+	})
+
+	ctx := context.WithValue(context.Background(), ctxKey("k"), "v")
+	if err := m.Fire(ctx, eventSubmit); err != nil {
+		t.Fatalf("Fire returned error: %v", err)
+	}
+
+	if got != "v" {
+		t.Errorf("guard saw ctx value %v, want \"v\"", got)
+	}
+}
+
+// Guards key on the edge (from, event). Two events reaching the same target must not share one.
+func TestEventMachineGuardKeying(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return errors.New("submit blocked")
+	})
+
+	if err := m.CanFire(ctx, eventSubmit); err == nil {
+		t.Error("CanFire(submit) = nil, want the guard's refusal")
+	}
+
+	if err := m.CanFire(ctx, eventResubmit); err != nil {
+		t.Errorf("CanFire(resubmit) = %v, want nil; it must not inherit submit's guard", err)
+	}
+
+	if err := m.CanFire(ctx, eventCancel); err != nil {
+		t.Errorf("CanFire(cancel) = %v, want nil; an unrelated edge must be unguarded", err)
+	}
+}
+
+// CanFire consults the guard, which is what makes guards a distinct tier from hooks.
+func TestEventMachineCanFireRunsGuard(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	calls := 0
+	m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		calls++
+
+		return errors.New("no")
+	})
+
+	if err := m.CanFire(ctx, eventSubmit); err == nil {
+		t.Fatal("CanFire = nil, want the guard's refusal")
+	}
+
+	if calls != 1 {
+		t.Errorf("guard ran %d times during CanFire, want 1", calls)
+	}
+
+	if got := m.Current(); got != stateDraft {
+		t.Errorf("CanFire moved the machine to %q", got)
+	}
+}
+
+// Fire must consult the guard exactly once, not once via its own check and again via CanFire.
+func TestEventMachineFireRunsGuardOnce(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	calls := 0
+	m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		calls++
+
+		return nil
+	})
+
+	if err := m.Fire(ctx, eventSubmit); err != nil {
+		t.Fatalf("Fire returned error: %v", err)
+	}
+
+	if calls != 1 {
+		t.Errorf("guard ran %d times during one Fire, want 1", calls)
+	}
+}
+
+func TestEventMachineGuardOverwrite(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return errors.New("first")
+	})
+	m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return errors.New("second")
+	})
+
+	err := m.CanFire(ctx, eventSubmit)
+	if err == nil {
+		t.Fatal("CanFire = nil, want the second guard's refusal")
+	}
+
+	if !strings.Contains(err.Error(), "second") {
+		t.Errorf("err = %q, want the second registration to have replaced the first", err.Error())
+	}
+}
+
+// --- exit and enter hooks -----------------------------------------------------------------------------------------
+
+// A blocking exit hook aborts before the commit, so nothing moved and the enter hook never ran.
+func TestEventMachineOnExitBlocking(t *testing.T) {
+	ctx := context.Background()
+	held := errors.New("hold not released")
+
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	entered := false
+	m.OnExitBlocking(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return held
+	}).OnEnter(stateReview, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		entered = true
+
+		return nil
+	})
+
+	err := m.Fire(ctx, eventSubmit)
+	if err == nil {
+		t.Fatal("Fire returned nil error, want the exit hook's abort")
+	}
+
+	if !errors.Is(err, held) {
+		t.Errorf("err = %v, want it to wrap the hook's error", err)
+	}
+
+	var te *fsm.TransitionError[orderState, orderEvent]
+	if !errors.As(err, &te) {
+		t.Fatalf("err is %T, want *fsm.TransitionError", err)
+	}
+
+	if te.Phase != fsm.PhaseExit {
+		t.Errorf("Phase = %v, want PhaseExit", te.Phase)
+	}
+
+	if te.Moved() {
+		t.Error("Moved() = true, want false; a blocking exit hook aborts before the commit")
+	}
+
+	if got := m.Current(); got != stateDraft {
+		t.Errorf("Current() = %q, want %q", got, stateDraft)
+	}
+
+	if entered {
+		t.Error("the enter hook ran even though the transition was aborted")
+	}
+}
+
+// A non-blocking exit hook reports its error but does not stop the transition, so the machine DID move.
+func TestEventMachineOnExitReporting(t *testing.T) {
+	ctx := context.Background()
+	metrics := errors.New("metrics push failed")
+
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+	m.OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return metrics
+	})
+
+	err := m.Fire(ctx, eventSubmit)
+	if err == nil {
+		t.Fatal("Fire returned nil error, want the hook's error reported")
+	}
+
+	if !errors.Is(err, metrics) {
+		t.Errorf("err = %v, want it to wrap the hook's error", err)
+	}
+
+	if got := m.Current(); got != stateReview {
+		t.Fatalf("Current() = %q, want %q; a non-blocking hook must not stop the move", got, stateReview)
+	}
+
+	var te *fsm.TransitionError[orderState, orderEvent]
+	if !errors.As(err, &te) {
+		t.Fatalf("err is %T, want *fsm.TransitionError", err)
+	}
+
+	if !te.Moved() {
+		t.Error("Moved() = false, want true; the machine did move despite the reported error")
+	}
+}
+
+func TestEventMachineOnEnter(t *testing.T) {
+	ctx := context.Background()
+	notify := errors.New("notify failed")
+
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+	m.OnEnter(stateReview, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return notify
+	})
+
+	err := m.Fire(ctx, eventSubmit)
+	if err == nil {
+		t.Fatal("Fire returned nil error, want the enter hook's error")
+	}
+
+	if got := m.Current(); got != stateReview {
+		t.Fatalf("Current() = %q, want %q; an enter hook runs after the commit", got, stateReview)
+	}
+
+	var te *fsm.TransitionError[orderState, orderEvent]
+	if !errors.As(err, &te) {
+		t.Fatalf("err is %T, want *fsm.TransitionError", err)
+	}
+
+	if te.Phase != fsm.PhaseEnter {
+		t.Errorf("Phase = %v, want PhaseEnter", te.Phase)
+	}
+
+	if !te.Moved() {
+		t.Error("Moved() = false, want true")
+	}
+}
+
+// OnExit and OnExitBlocking share one slot, so the last registration decides both the function and whether it blocks.
+func TestEventMachineExitHookSlotIsShared(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("boom")
+
+	t.Run("OnExit after OnExitBlocking stops blocking", func(t *testing.T) {
+		m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+		m.OnExitBlocking(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			return boom
+		})
+		m.OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			return boom
+		})
+
+		if err := m.Fire(ctx, eventSubmit); err == nil {
+			t.Fatal("Fire returned nil error, want the reported hook error")
+		}
+
+		if got := m.Current(); got != stateReview {
+			t.Errorf("Current() = %q, want %q; the later OnExit must not block", got, stateReview)
+		}
+	})
+
+	t.Run("OnExitBlocking after OnExit starts blocking", func(t *testing.T) {
+		m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+		m.OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			return boom
+		})
+		m.OnExitBlocking(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			return boom
+		})
+
+		if err := m.Fire(ctx, eventSubmit); err == nil {
+			t.Fatal("Fire returned nil error, want the abort")
+		}
+
+		if got := m.Current(); got != stateDraft {
+			t.Errorf("Current() = %q, want %q; the later OnExitBlocking must abort", got, stateDraft)
+		}
+	})
+
+	t.Run("only one exit hook runs, the last registered", func(t *testing.T) {
+		m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+		var ran []string
+		m.OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			ran = append(ran, "first")
+
+			return nil
+		})
+		m.OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+			ran = append(ran, "second")
+
+			return nil
+		})
+
+		if err := m.Fire(ctx, eventSubmit); err != nil {
+			t.Fatalf("Fire returned error: %v", err)
+		}
+
+		if len(ran) != 1 || ran[0] != "second" {
+			t.Errorf("hooks ran = %v, want [second]; registration overwrites silently", ran)
+		}
+	})
+}
+
+func TestEventMachineOnEnterOverwrite(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	var ran []string
+	m.OnEnter(stateReview, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		ran = append(ran, "first")
+
+		return nil
+	})
+	m.OnEnter(stateReview, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		ran = append(ran, "second")
+
+		return nil
+	})
+
+	if err := m.Fire(ctx, eventSubmit); err != nil {
+		t.Fatalf("Fire returned error: %v", err)
+	}
+
+	if len(ran) != 1 || ran[0] != "second" {
+		t.Errorf("hooks ran = %v, want [second]", ran)
+	}
+}
+
+// The pipeline runs in one fixed order, and the commit sits between the exit and enter hooks.
+func TestEventMachinePipelineOrder(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	var order []string
+	m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		order = append(order, "guard:"+string(m.Current()))
+
+		return nil
+	}).OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		order = append(order, "exit:"+string(m.Current()))
+
+		return nil
+	}).OnEnter(stateReview, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		order = append(order, "enter:"+string(m.Current()))
+
+		return nil
+	})
+
+	if err := m.Fire(ctx, eventSubmit); err != nil {
+		t.Fatalf("Fire returned error: %v", err)
+	}
+
+	want := []string{"guard:Draft", "exit:Draft", "enter:Review"}
+	if len(order) != len(want) {
+		t.Fatalf("order = %v, want %v", order, want)
+	}
+
+	for i := range want {
+		if order[i] != want[i] {
+			t.Errorf("order = %v, want %v", order, want)
+
+			break
+		}
+	}
+}
+
+// A reporting exit hook and a failing enter hook can both produce errors in one call. Both must reach the caller, and
+// the machine did move.
+func TestEventMachineBothHooksReportErrors(t *testing.T) {
+	ctx := context.Background()
+	exitErr := errors.New("metrics push failed")
+	enterErr := errors.New("notify failed")
+
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+	m.OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return exitErr
+	}).OnEnter(stateReview, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return enterErr
+	})
+
+	err := m.Fire(ctx, eventSubmit)
+	if err == nil {
+		t.Fatal("Fire returned nil error, want both hook errors")
+	}
+
+	if !errors.Is(err, exitErr) {
+		t.Error("the exit hook's error did not reach the caller")
+	}
+
+	if !errors.Is(err, enterErr) {
+		t.Error("the enter hook's error did not reach the caller")
+	}
+
+	if got := m.Current(); got != stateReview {
+		t.Errorf("Current() = %q, want %q", got, stateReview)
+	}
+}
+
+// The invariant from the design: CanFire reports whether a move is permitted, not that it will succeed.
+func TestEventMachineCanFireDoesNotPromiseSuccess(t *testing.T) {
+	ctx := context.Background()
+
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+	m.OnExitBlocking(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return errors.New("hold not released")
+	})
+
+	if err := m.CanFire(ctx, eventSubmit); err != nil {
+		t.Fatalf("CanFire = %v, want nil; the edge exists and no guard refuses", err)
+	}
+
+	if err := m.Fire(ctx, eventSubmit); err == nil {
+		t.Fatal("Fire = nil, want the blocking exit hook to abort a move CanFire permitted")
+	}
+
+	if got := m.Current(); got != stateDraft {
+		t.Errorf("Current() = %q, want %q", got, stateDraft)
+	}
+}
+
+// --- reentrancy ---------------------------------------------------------------------------------------------------
+
+// A hook that calls back into its own machine is refused from every phase. Without this, a nested call from an exit
+// hook would commit and then be silently overwritten by the outer call's stale target.
+func TestEventMachineReentrancy(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name string
+		// register wires a hook that attempts a nested Fire, and returns a pointer to where the nested error lands.
+		register func(m *fsm.EventMachine[orderState, orderEvent], nested *error)
+		// wantCurrent is where the machine ends up after the outer Fire.
+		wantCurrent orderState
+	}{
+		{
+			"from a guard",
+			func(m *fsm.EventMachine[orderState, orderEvent], nested *error) {
+				m.Guard(stateDraft, eventSubmit, func(c context.Context, _ fsm.Transition[orderState, orderEvent]) error {
+					*nested = m.Fire(c, eventCancel)
+
+					return nil
+				})
+			},
+			stateReview,
+		},
+		{
+			"from an exit hook",
+			func(m *fsm.EventMachine[orderState, orderEvent], nested *error) {
+				m.OnExit(stateDraft, func(c context.Context, _ fsm.Transition[orderState, orderEvent]) error {
+					*nested = m.Fire(c, eventCancel)
+
+					return nil
+				})
+			},
+			stateReview,
+		},
+		{
+			"from an enter hook",
+			func(m *fsm.EventMachine[orderState, orderEvent], nested *error) {
+				m.OnEnter(stateReview, func(c context.Context, _ fsm.Transition[orderState, orderEvent]) error {
+					*nested = m.Fire(c, eventPay)
+
+					return nil
+				})
+			},
+			stateReview,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+			var nested error
+			tt.register(m, &nested)
+
+			if err := m.Fire(ctx, eventSubmit); err != nil {
+				t.Fatalf("the outer Fire returned error: %v", err)
+			}
+
+			if !errors.Is(nested, fsm.ErrReentrant) {
+				t.Errorf("nested Fire returned %v, want ErrReentrant", nested)
+			}
+
+			if got := m.Current(); got != tt.wantCurrent {
+				t.Errorf("Current() = %q, want %q; the outer transition must be unaffected", got, tt.wantCurrent)
+			}
+
+			// The in-flight flag must be clear again, or the machine would be permanently stuck.
+			if err := m.CanFire(ctx, eventPay); err != nil && errors.Is(err, fsm.ErrReentrant) {
+				t.Error("the machine is still marked in-flight after the outer transition finished")
+			}
+		})
+	}
+}
+
+// After any transition, including one that a guard or a blocking exit hook aborted, the machine must accept a later
+// call. This proves the in-flight flag is cleared on every exit path, not only the successful one.
+func TestEventMachineInFlightClearedOnEveryPath(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("boom")
+
+	tests := []struct {
+		name  string
+		setup func(m *fsm.EventMachine[orderState, orderEvent])
+		event orderEvent
+	}{
+		{"after a failed resolve", func(*fsm.EventMachine[orderState, orderEvent]) {}, eventPay},
+		{
+			"after a guard refusal",
+			func(m *fsm.EventMachine[orderState, orderEvent]) {
+				m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+					return boom
+				})
+			},
+			eventSubmit,
+		},
+		{
+			"after a blocking exit hook aborted",
+			func(m *fsm.EventMachine[orderState, orderEvent]) {
+				m.OnExitBlocking(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+					return boom
+				})
+			},
+			eventSubmit,
+		},
+		{
+			"after an enter hook failed",
+			func(m *fsm.EventMachine[orderState, orderEvent]) {
+				m.OnEnter(stateCanceled, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+					return boom
+				})
+			},
+			eventCancel,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := fsm.MustEventMachine(orderGraph(), stateDraft)
+			tt.setup(m)
+
+			// The first call is expected to fail in most rows; that is the point.
+			if err := m.Fire(ctx, tt.event); err != nil {
+				t.Logf("first call failed as expected: %v", err)
+			}
+
+			if err := m.CanFire(ctx, eventSubmit); errors.Is(err, fsm.ErrReentrant) {
+				t.Error("the machine is still marked in-flight, so it would reject every later call")
+			}
+		})
+	}
+}
+
+// A hook may safely ask questions of the machine; only moving it is refused.
+func TestEventMachineReadsAreAllowedFromHooks(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	var seenDuringExit orderState
+	m.OnExit(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		seenDuringExit = m.Current()
+
+		return nil
+	})
+
+	var seenDuringEnter orderState
+	m.OnEnter(stateReview, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		seenDuringEnter = m.Current()
+
+		return nil
+	})
+
+	if err := m.Fire(ctx, eventSubmit); err != nil {
+		t.Fatalf("Fire returned error: %v", err)
+	}
+
+	if seenDuringExit != stateDraft {
+		t.Errorf("during the exit hook Current() = %q, want %q; the commit has not happened yet", seenDuringExit, stateDraft)
+	}
+
+	if seenDuringEnter != stateReview {
+		t.Errorf("during the enter hook Current() = %q, want %q; the commit has happened", seenDuringEnter, stateReview)
+	}
+}
+
+func ExampleEventMachine_OnExitBlocking() {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	// Work that can fail and whose failure should prevent the move belongs here, so the transition never commits and
+	// there is nothing to undo.
+	m.OnExitBlocking(stateDraft, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return errors.New("hold not released")
+	})
+
+	if err := m.Fire(ctx, eventSubmit); err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Println(m.Current())
+
+	// Output:
+	// fsm: exit Draft -> Review (event submit): hold not released
+	// Draft
+}
+
+func ExampleEventMachine_Guard() {
+	ctx := context.Background()
+	m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+	// A guard is a pure predicate, so CanFire may ask it without the move happening.
+	m.Guard(stateDraft, eventSubmit, func(context.Context, fsm.Transition[orderState, orderEvent]) error {
+		return errors.New("order has no items")
+	})
+
+	fmt.Println(m.CanFire(ctx, eventSubmit))
+	fmt.Println(m.Current())
+
+	// Output:
+	// fsm: guard Draft -> Review (event submit): order has no items
+	// Draft
 }
