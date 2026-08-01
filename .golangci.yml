@@ -77,6 +77,10 @@ linters:
       require-specific: true
   exclusions:
     warn-unused: true
+    rules:
+      - linters:
+          - revive
+        text: "confusing-naming: Method 'String'"
 formatters:
   enable:
     - gci
