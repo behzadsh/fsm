@@ -19,6 +19,9 @@ const (
 	stateShipped  orderState = "Shipped"
 	stateCanceled orderState = "Canceled"
 	stateRefunded orderState = "Refunded"
+
+	// Deliberately absent from every graph in this package.
+	stateUnknown orderState = "Unknown"
 )
 
 const (
@@ -27,6 +30,9 @@ const (
 	eventCancel   orderEvent = "cancel"
 	eventPay      orderEvent = "pay"
 	eventShip     orderEvent = "ship"
+
+	// Deliberately absent from every graph in this package.
+	eventUnknown orderEvent = "unknown"
 )
 
 // orderGraph is the graph most tests work against:

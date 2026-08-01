@@ -22,6 +22,24 @@ import (
 //		MustBuild()
 type EventGraph[S ~string, E ~string] struct {
 	edges map[S]map[E]S
+
+	// states is every state named by the graph, whether as the source of an edge or only as a target. It is the
+	// universe a machine's state is validated against.
+	states map[S]struct{}
+}
+
+// hasState reports whether the graph names the state at all, as the source of an edge or only as a target.
+func (g EventGraph[S, E]) hasState(state S) bool {
+	_, ok := g.states[state]
+
+	return ok
+}
+
+// target returns the state the edge (from, event) leads to, and whether that edge is declared.
+func (g EventGraph[S, E]) target(from S, event E) (S, bool) {
+	to, ok := g.edges[from][event]
+
+	return to, ok
 }
 
 // NewEventGraph returns an empty builder for a graph whose states are of type S and whose events are of type E.
@@ -97,15 +115,20 @@ func (b *EventGraphBuilder[S, E]) On(from S, event E, to S) *EventGraphBuilder[S
 //		// duplicate edge (Draft, submit): -> Review and -> Paid
 //	}
 func (b *EventGraphBuilder[S, E]) Build() (EventGraph[S, E], error) {
-	graph := EventGraph[S, E]{edges: make(map[S]map[E]S, len(b.edges))}
+	graph := EventGraph[S, E]{
+		edges:  make(map[S]map[E]S, len(b.edges)),
+		states: make(map[S]struct{}, len(b.edges)),
+	}
 
 	for from, byEvent := range b.edges {
 		targets := make(map[E]S, len(byEvent))
 		for event, to := range byEvent {
 			targets[event] = to
+			graph.states[to] = struct{}{}
 		}
 
 		graph.edges[from] = targets
+		graph.states[from] = struct{}{}
 	}
 
 	if len(b.errs) > 0 {

@@ -12,9 +12,7 @@ func (g EventGraph[S, E]) EdgeMapForTest() map[S]map[E]S {
 
 // TargetForTest reports the target of the edge (from, event) and whether it exists.
 func (g EventGraph[S, E]) TargetForTest(from S, event E) (S, bool) {
-	to, ok := g.edges[from][event]
-
-	return to, ok
+	return g.target(from, event)
 }
 
 // EdgeCountForTest returns the total number of edges in the graph.
