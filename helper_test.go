@@ -1,6 +1,9 @@
 package fsm_test
 
 import (
+	"strings"
+	"testing"
+
 	"github.com/behzadsh/fsm"
 )
 
@@ -57,4 +60,36 @@ func orderGraph() fsm.EventGraph[orderState, orderEvent] {
 		On(statePaid, eventShip, stateShipped).
 		On(statePaid, eventCancel, stateRefunded).
 		MustBuild()
+}
+
+// statusGraph is the same lifecycle expressed without events, for the simple surface:
+//
+//	Draft   -> Review, Canceled
+//	Review  -> Paid, Canceled
+//	Paid    -> Shipped, Refunded
+//	Shipped, Canceled, Refunded: terminal
+//
+// Each call returns a freshly built graph, so a test may not affect any other.
+func statusGraph() fsm.Graph[orderState] {
+	return fsm.NewGraph[orderState]().
+		To(stateDraft, stateReview, stateCanceled).
+		To(stateReview, statePaid, stateCanceled).
+		To(statePaid, stateShipped, stateRefunded).
+		MustBuild()
+}
+
+// assertNoEventVocabulary fails when an error produced by the simple, state-only surface mentions events. That surface
+// is implemented on top of the labeled engine, so this is the check that the binding never shows through.
+func assertNoEventVocabulary(t *testing.T, err error) {
+	t.Helper()
+
+	if err == nil {
+		return
+	}
+
+	for _, leak := range []string{"event", "fire", "Fire"} {
+		if strings.Contains(err.Error(), leak) {
+			t.Errorf("error %q contains %q; the simple surface must not mention events", err.Error(), leak)
+		}
+	}
 }

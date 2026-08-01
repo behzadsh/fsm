@@ -1086,3 +1086,446 @@ func ExampleEventMachine_Guard() {
 	// fsm: guard Draft -> Review (event submit): order has no items
 	// Draft
 }
+
+// --- the simple, state-only surface -------------------------------------------------------------------------------
+
+func TestNew(t *testing.T) {
+	tests := []struct {
+		name    string
+		initial orderState
+		wantErr bool
+	}{
+		{"a state with outgoing edges", stateDraft, false},
+		{"a terminal state", stateShipped, false},
+		{"a state absent from the graph", stateUnknown, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m, err := fsm.New(statusGraph(), tt.initial)
+
+			if tt.wantErr {
+				if !errors.Is(err, fsm.ErrUnknownState) {
+					t.Fatalf("err = %v, want it to wrap ErrUnknownState", err)
+				}
+
+				assertNoEventVocabulary(t, err)
+
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("New(%q) returned error: %v", tt.initial, err)
+			}
+
+			if got := m.Current(); got != tt.initial {
+				t.Errorf("Current() = %q, want %q", got, tt.initial)
+			}
+		})
+	}
+}
+
+func TestMustNew(t *testing.T) {
+	t.Run("returns a machine for a known state", func(t *testing.T) {
+		if got := fsm.MustNew(statusGraph(), stateDraft).Current(); got != stateDraft {
+			t.Errorf("Current() = %q, want %q", got, stateDraft)
+		}
+	})
+
+	t.Run("panics on an unknown state", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("MustNew did not panic on an unknown state")
+			}
+		}()
+
+		fsm.MustNew(statusGraph(), stateUnknown)
+	})
+}
+
+func TestMachineTransitionTo(t *testing.T) {
+	ctx := context.Background()
+
+	tests := []struct {
+		name    string
+		from    orderState
+		to      orderState
+		want    orderState
+		wantErr string
+	}{
+		{"a declared edge", stateDraft, stateReview, stateReview, ""},
+		{"a second target from the same source", stateDraft, stateCanceled, stateCanceled, ""},
+		{"into a terminal state", statePaid, stateShipped, stateShipped, ""},
+		{
+			"no edge between these states",
+			stateDraft,
+			statePaid,
+			stateDraft,
+			"fsm: cannot transition Draft -> Paid: invalid transition",
+		},
+		{
+			"backwards along a declared edge",
+			stateReview,
+			stateDraft,
+			stateReview,
+			"fsm: cannot transition Review -> Draft: invalid transition",
+		},
+		{
+			"a state absent from the graph",
+			stateDraft,
+			stateUnknown,
+			stateDraft,
+			"fsm: cannot transition Draft -> Unknown: invalid transition",
+		},
+		{
+			"from a terminal state",
+			stateShipped,
+			stateDraft,
+			stateShipped,
+			"fsm: cannot transition Shipped -> Draft: invalid transition",
+		},
+		{
+			"a self transition that was never declared",
+			stateDraft,
+			stateDraft,
+			stateDraft,
+			"fsm: cannot transition Draft -> Draft: invalid transition",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			m := fsm.MustNew(statusGraph(), tt.from)
+
+			err := m.TransitionTo(ctx, tt.to)
+
+			if tt.wantErr == "" {
+				if err != nil {
+					t.Fatalf("TransitionTo(%q) returned error: %v", tt.to, err)
+				}
+			} else {
+				if err == nil {
+					t.Fatalf("TransitionTo(%q) returned nil error, want %q", tt.to, tt.wantErr)
+				}
+
+				if err.Error() != tt.wantErr {
+					t.Errorf("err = %q, want %q", err.Error(), tt.wantErr)
+				}
+
+				if !errors.Is(err, fsm.ErrInvalidTransition) {
+					t.Errorf("err = %v, want it to wrap ErrInvalidTransition", err)
+				}
+
+				assertNoEventVocabulary(t, err)
+			}
+
+			if got := m.Current(); got != tt.want {
+				t.Errorf("Current() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+// A failed resolve on this surface still names both ends. The engine cannot, because it never found an edge, but the
+// caller named the target explicitly so the rewriter can restore it.
+func TestMachineTransitionToNamesBothEnds(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustNew(statusGraph(), stateDraft)
+
+	err := m.TransitionTo(ctx, statePaid)
+	if err == nil {
+		t.Fatal("TransitionTo returned nil error")
+	}
+
+	for _, want := range []string{"Draft", "Paid"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("err = %q, want it to name %q", err.Error(), want)
+		}
+	}
+}
+
+func TestMachineCanTransitionTo(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustNew(statusGraph(), stateDraft)
+
+	if err := m.CanTransitionTo(ctx, stateReview); err != nil {
+		t.Errorf("CanTransitionTo(Review) = %v, want nil", err)
+	}
+
+	err := m.CanTransitionTo(ctx, statePaid)
+	if err == nil {
+		t.Error("CanTransitionTo(Paid) = nil, want an error")
+	}
+
+	assertNoEventVocabulary(t, err)
+
+	if got := m.Current(); got != stateDraft {
+		t.Errorf("CanTransitionTo moved the machine to %q", got)
+	}
+}
+
+func TestMachineHooksReceiveChange(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("hooks receive a Change carrying both ends", func(t *testing.T) {
+		m := fsm.MustNew(statusGraph(), stateDraft)
+
+		var exit, enter fsm.Change[orderState]
+		m.OnExit(stateDraft, func(_ context.Context, c fsm.Change[orderState]) error {
+			exit = c
+
+			return nil
+		}).OnEnter(stateReview, func(_ context.Context, c fsm.Change[orderState]) error {
+			enter = c
+
+			return nil
+		})
+
+		if err := m.TransitionTo(ctx, stateReview); err != nil {
+			t.Fatalf("TransitionTo returned error: %v", err)
+		}
+
+		if exit.From != stateDraft || exit.To != stateReview {
+			t.Errorf("exit hook saw %+v, want Draft -> Review", exit)
+		}
+
+		if enter.From != stateDraft || enter.To != stateReview {
+			t.Errorf("enter hook saw %+v, want Draft -> Review", enter)
+		}
+	})
+}
+
+func TestMachineHookBlocking(t *testing.T) {
+	ctx := context.Background()
+	boom := errors.New("boom")
+
+	t.Run("a blocking exit hook aborts and the message names no event", func(t *testing.T) {
+		m := fsm.MustNew(statusGraph(), stateDraft)
+		m.OnExitBlocking(stateDraft, func(context.Context, fsm.Change[orderState]) error {
+			return boom
+		})
+
+		err := m.TransitionTo(ctx, stateReview)
+		if err == nil {
+			t.Fatal("TransitionTo returned nil error, want the abort")
+		}
+
+		if !errors.Is(err, boom) {
+			t.Errorf("err = %v, want it to wrap the hook's error", err)
+		}
+
+		assertNoEventVocabulary(t, err)
+
+		if got := m.Current(); got != stateDraft {
+			t.Errorf("Current() = %q, want %q", got, stateDraft)
+		}
+	})
+
+	t.Run("a reporting exit hook does not stop the move", func(t *testing.T) {
+		m := fsm.MustNew(statusGraph(), stateDraft)
+		m.OnExit(stateDraft, func(context.Context, fsm.Change[orderState]) error {
+			return boom
+		})
+
+		if err := m.TransitionTo(ctx, stateReview); err == nil {
+			t.Fatal("TransitionTo returned nil error, want the reported error")
+		}
+
+		if got := m.Current(); got != stateReview {
+			t.Errorf("Current() = %q, want %q", got, stateReview)
+		}
+	})
+
+	t.Run("an enter hook error is reported after the move", func(t *testing.T) {
+		m := fsm.MustNew(statusGraph(), stateDraft)
+		m.OnEnter(stateReview, func(context.Context, fsm.Change[orderState]) error {
+			return boom
+		})
+
+		err := m.TransitionTo(ctx, stateReview)
+		if err == nil {
+			t.Fatal("TransitionTo returned nil error, want the enter hook's error")
+		}
+
+		assertNoEventVocabulary(t, err)
+
+		if got := m.Current(); got != stateReview {
+			t.Errorf("Current() = %q, want %q", got, stateReview)
+		}
+	})
+}
+
+func TestMachineBothHooksFail(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("both hooks failing reports both, and neither names an event", func(t *testing.T) {
+		exitErr := errors.New("metrics failed")
+		enterErr := errors.New("notify failed")
+
+		m := fsm.MustNew(statusGraph(), stateDraft)
+		m.OnExit(stateDraft, func(context.Context, fsm.Change[orderState]) error {
+			return exitErr
+		}).OnEnter(stateReview, func(context.Context, fsm.Change[orderState]) error {
+			return enterErr
+		})
+
+		err := m.TransitionTo(ctx, stateReview)
+		if !errors.Is(err, exitErr) || !errors.Is(err, enterErr) {
+			t.Errorf("err = %v, want both hook errors reachable", err)
+		}
+
+		assertNoEventVocabulary(t, err)
+	})
+}
+
+// On this surface a guard keys on the edge from -> to, which is the same key the engine uses.
+func TestMachineGuard(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustNew(statusGraph(), stateDraft)
+
+	m.Guard(stateDraft, stateReview, func(context.Context, fsm.Change[orderState]) error {
+		return errors.New("order has no items")
+	})
+
+	err := m.CanTransitionTo(ctx, stateReview)
+	if err == nil {
+		t.Fatal("CanTransitionTo(Review) = nil, want the guard's refusal")
+	}
+
+	assertNoEventVocabulary(t, err)
+
+	if err := m.CanTransitionTo(ctx, stateCanceled); err != nil {
+		t.Errorf("CanTransitionTo(Canceled) = %v, want nil; an unrelated edge must be unguarded", err)
+	}
+}
+
+func TestMachineForceStateAndPredicates(t *testing.T) {
+	m := fsm.MustNew(statusGraph(), stateShipped)
+
+	if !m.Is(stateShipped) {
+		t.Error("Is(Shipped) = false, want true")
+	}
+
+	if got := m.String(); got != "Shipped" {
+		t.Errorf("String() = %q, want %q", got, "Shipped")
+	}
+
+	if err := m.ForceState(stateDraft); err != nil {
+		t.Fatalf("ForceState returned error: %v", err)
+	}
+
+	if got := m.Current(); got != stateDraft {
+		t.Errorf("Current() = %q, want %q", got, stateDraft)
+	}
+
+	err := m.ForceState(stateUnknown)
+	if !errors.Is(err, fsm.ErrUnknownState) {
+		t.Errorf("err = %v, want it to wrap ErrUnknownState", err)
+	}
+
+	assertNoEventVocabulary(t, err)
+}
+
+// Reentrancy is refused on this surface too.
+func TestMachineReentrancy(t *testing.T) {
+	ctx := context.Background()
+	m := fsm.MustNew(statusGraph(), stateDraft)
+
+	var nested error
+	m.OnEnter(stateReview, func(c context.Context, _ fsm.Change[orderState]) error {
+		nested = m.TransitionTo(c, statePaid)
+
+		return nil
+	})
+
+	if err := m.TransitionTo(ctx, stateReview); err != nil {
+		t.Fatalf("the outer TransitionTo returned error: %v", err)
+	}
+
+	if !errors.Is(nested, fsm.ErrReentrant) {
+		t.Errorf("nested TransitionTo returned %v, want ErrReentrant", nested)
+	}
+
+	if got := m.Current(); got != stateReview {
+		t.Errorf("Current() = %q, want %q", got, stateReview)
+	}
+}
+
+func ExampleMachine_TransitionTo() {
+	ctx := context.Background()
+	m := fsm.MustNew(statusGraph(), stateDraft)
+
+	if err := m.TransitionTo(ctx, stateReview); err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Println(m.Current())
+
+	// The graph declares no edge from Review back to Draft.
+	if err := m.TransitionTo(ctx, stateDraft); err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Println(m.Current())
+
+	// Output:
+	// Review
+	// fsm: cannot transition Review -> Draft: invalid transition
+	// Review
+}
+
+func ExampleMachine_OnEnter() {
+	ctx := context.Background()
+	m := fsm.MustNew(statusGraph(), stateDraft)
+
+	m.OnEnter(stateReview, func(_ context.Context, c fsm.Change[orderState]) error {
+		fmt.Printf("moved %s -> %s\n", c.From, c.To)
+
+		return nil
+	})
+
+	if err := m.TransitionTo(ctx, stateReview); err != nil {
+		fmt.Println(err)
+	}
+
+	// Output:
+	// moved Draft -> Review
+}
+
+// Registering a nil hook is ignored rather than stored and called, so a nil cannot panic mid-transition.
+func TestNilHooksAreIgnored(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("on the simple surface", func(t *testing.T) {
+		m := fsm.MustNew(statusGraph(), stateDraft)
+
+		m.Guard(stateDraft, stateReview, nil).
+			OnExit(stateDraft, nil).
+			OnEnter(stateReview, nil)
+
+		if err := m.TransitionTo(ctx, stateReview); err != nil {
+			t.Fatalf("TransitionTo returned error: %v", err)
+		}
+
+		if got := m.Current(); got != stateReview {
+			t.Errorf("Current() = %q, want %q", got, stateReview)
+		}
+	})
+
+	t.Run("on the labeled surface", func(t *testing.T) {
+		m := fsm.MustEventMachine(orderGraph(), stateDraft)
+
+		m.Guard(stateDraft, eventSubmit, nil).
+			OnExit(stateDraft, nil).
+			OnExitBlocking(stateDraft, nil).
+			OnEnter(stateReview, nil)
+
+		if err := m.Fire(ctx, eventSubmit); err != nil {
+			t.Fatalf("Fire returned error: %v", err)
+		}
+
+		if got := m.Current(); got != stateReview {
+			t.Errorf("Current() = %q, want %q", got, stateReview)
+		}
+	})
+}

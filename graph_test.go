@@ -1,6 +1,7 @@
 package fsm_test
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
@@ -309,4 +310,122 @@ func ExampleEventGraphBuilder_Build() {
 
 	// Output:
 	// 2
+}
+
+// --- the simple, state-only surface -------------------------------------------------------------------------------
+
+func TestNewGraph(t *testing.T) {
+	t.Run("a builder with no edges yields an empty graph", func(t *testing.T) {
+		if _, err := fsm.NewGraph[orderState]().Build(); err != nil {
+			t.Fatalf("Build() returned error: %v", err)
+		}
+	})
+
+	t.Run("To is variadic, declaring one source to many targets", func(t *testing.T) {
+		g := fsm.NewGraph[orderState]().
+			To(stateDraft, stateReview, stateCanceled).
+			MustBuild()
+
+		m := fsm.MustNew(g, stateDraft)
+
+		for _, to := range []orderState{stateReview, stateCanceled} {
+			if err := m.CanTransitionTo(context.Background(), to); err != nil {
+				t.Errorf("CanTransitionTo(%q) = %v, want nil", to, err)
+			}
+		}
+	})
+
+	t.Run("To with no targets declares nothing", func(t *testing.T) {
+		g := fsm.NewGraph[orderState]().To(stateDraft).MustBuild()
+
+		if _, err := fsm.New(g, stateDraft); err == nil {
+			t.Error("New = nil error, want ErrUnknownState; no edge means no state was declared")
+		}
+	})
+}
+
+func TestGraphBuilderDuplicateEdge(t *testing.T) {
+	t.Run("Build reports the conflict without naming an event", func(t *testing.T) {
+		_, err := fsm.NewGraph[orderState]().
+			To(stateDraft, stateReview).
+			To(stateDraft, stateReview).
+			Build()
+		if err == nil {
+			t.Fatal("Build() returned nil error, want a duplicate-edge error")
+		}
+
+		const want = "duplicate edge Draft -> Review"
+		if err.Error() != want {
+			t.Errorf("err = %q, want %q", err.Error(), want)
+		}
+
+		assertNoEventVocabulary(t, err)
+	})
+
+	t.Run("a duplicate inside a single variadic call is still caught", func(t *testing.T) {
+		_, err := fsm.NewGraph[orderState]().
+			To(stateDraft, stateReview, stateReview).
+			Build()
+		if err == nil {
+			t.Fatal("Build() returned nil error, want a duplicate-edge error")
+		}
+	})
+
+	t.Run("MustBuild panics on the conflict", func(t *testing.T) {
+		defer func() {
+			if r := recover(); r == nil {
+				t.Fatal("MustBuild() did not panic on a duplicate edge")
+			}
+		}()
+
+		fsm.NewGraph[orderState]().
+			To(stateDraft, stateReview).
+			To(stateDraft, stateReview).
+			MustBuild()
+	})
+}
+
+// A graph built by the simple builder is sealed exactly as the labeled one is.
+func TestGraphSealedAfterBuild(t *testing.T) {
+	ctx := context.Background()
+
+	b := fsm.NewGraph[orderState]().To(stateDraft, stateReview)
+	g := b.MustBuild()
+
+	b.To(stateReview, statePaid)
+
+	m := fsm.MustNew(g, stateDraft)
+	if err := m.TransitionTo(ctx, stateReview); err != nil {
+		t.Fatalf("TransitionTo returned error: %v", err)
+	}
+
+	if err := m.CanTransitionTo(ctx, statePaid); err == nil {
+		t.Error("an edge declared after the build leaked into the graph")
+	}
+}
+
+func ExampleNewGraph() {
+	ctx := context.Background()
+
+	graph := fsm.NewGraph[orderState]().
+		To(stateDraft, stateReview, stateCanceled).
+		To(stateReview, statePaid).
+		MustBuild()
+
+	m := fsm.MustNew(graph, stateDraft)
+
+	if err := m.TransitionTo(ctx, stateReview); err != nil {
+		fmt.Println(err)
+	}
+
+	fmt.Println(m.Current())
+
+	// No edge leads from Review to Shipped.
+	if err := m.TransitionTo(ctx, stateShipped); err != nil {
+		fmt.Println(err)
+	}
+
+	// Output:
+	// Review
+	// fsm: cannot transition Review -> Shipped: invalid transition
 }

@@ -157,3 +157,121 @@ func (b *EventGraphBuilder[S, E]) MustBuild() EventGraph[S, E] {
 
 	return graph
 }
+
+// Graph declares the states of a machine and the transitions between them, without naming the transitions.
+//
+// This is the simple surface. An edge is identified by the pair (from, to), and a machine moves by naming its
+// destination. Use EventGraph instead when one action must lead to different targets depending on where the machine
+// is, since expressing that requires naming the action.
+//
+// The zero value is an empty graph that permits no transition. Build one with NewGraph. A built graph is sealed, and
+// holds its own copy of the edges.
+//
+// Example:
+//
+//	graph := fsm.NewGraph[OrderState]().
+//		To(StateDraft, StateReview, StateCanceled).
+//		MustBuild()
+type Graph[S ~string] struct {
+	inner EventGraph[S, S]
+}
+
+// NewGraph returns an empty builder for a graph whose states are of type S.
+//
+// Example:
+//
+//	type OrderState string
+//
+//	builder := fsm.NewGraph[OrderState]()
+func NewGraph[S ~string]() *GraphBuilder[S] {
+	return &GraphBuilder[S]{
+		inner: NewEventGraph[S, S](),
+		seen:  map[S]map[S]struct{}{},
+	}
+}
+
+// GraphBuilder accumulates edges and the conflicts found while declaring them.
+//
+// Every method returns the builder, so declarations chain. Conflicts are collected and surfaced together by Build or
+// MustBuild.
+//
+// Example:
+//
+//	builder := fsm.NewGraph[OrderState]()
+//	builder = builder.To(StateDraft, StateReview)
+//	graph, err := builder.Build()
+type GraphBuilder[S ~string] struct {
+	inner *EventGraphBuilder[S, S]
+	seen  map[S]map[S]struct{}
+	errs  []error
+}
+
+// To declares that the machine may move from from to each of the given targets.
+//
+// It is variadic because one state usually leads to several, and reads as a row of a transition table. Declaring the
+// same pair (from, to) more than once is a conflict, reported by Build or MustBuild; calling To with no targets
+// declares nothing at all.
+//
+// Example:
+//
+//	builder.To(StateDraft, StateReview, StateCanceled)
+func (b *GraphBuilder[S]) To(from S, to ...S) *GraphBuilder[S] {
+	if b.seen[from] == nil {
+		b.seen[from] = map[S]struct{}{}
+	}
+
+	for _, target := range to {
+		if _, exists := b.seen[from][target]; exists {
+			b.errs = append(b.errs, fmt.Errorf("duplicate edge %s -> %s", from, target))
+
+			continue
+		}
+
+		b.seen[from][target] = struct{}{}
+
+		// Each edge is stored with its target state as the event name, which is what lets the simple surface reuse
+		// the labeled engine unchanged. Nothing outside this package can observe the binding.
+		b.inner.On(from, target, target)
+	}
+
+	return b
+}
+
+// Build returns the declared graph, or every conflict found while declaring it.
+//
+// Conflicts are joined with errors.Join. Use Build when the graph is assembled conditionally; use MustBuild for a
+// package-level variable.
+//
+// Example:
+//
+//	graph, err := builder.Build()
+//	if err != nil {
+//		// duplicate edge Draft -> Review
+//	}
+func (b *GraphBuilder[S]) Build() (Graph[S], error) {
+	inner, err := b.inner.Build()
+
+	graph := Graph[S]{inner: inner}
+
+	if len(b.errs) > 0 {
+		return graph, errors.Join(b.errs...)
+	}
+
+	return graph, err
+}
+
+// MustBuild returns the declared graph and panics if any conflict was found.
+//
+// Example:
+//
+//	var orderGraph = fsm.NewGraph[OrderState]().
+//		To(StateDraft, StateReview).
+//		MustBuild()
+func (b *GraphBuilder[S]) MustBuild() Graph[S] {
+	graph, err := b.Build()
+	if err != nil {
+		panic(err)
+	}
+
+	return graph
+}

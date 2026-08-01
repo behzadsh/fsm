@@ -298,7 +298,7 @@ func (m *EventMachine[S, E]) Fire(ctx context.Context, event E) error {
 		return err
 	}
 
-	if err := m.runGuard(ctx, transition); err != nil {
+	if err = m.runGuard(ctx, transition); err != nil {
 		return err
 	}
 
@@ -378,4 +378,270 @@ func (m *EventMachine[S, E]) runGuard(ctx context.Context, transition Transition
 	}
 
 	return nil
+}
+
+// Change describes one move on the simple surface: the state left and the state entered.
+//
+// It is what guards and hooks receive there. Unlike Transition it carries no event, because the simple surface has
+// none.
+//
+// Example:
+//
+//	func(ctx context.Context, c fsm.Change[OrderState]) error {
+//		log.Info("moved", "from", c.From, "to", c.To)
+//		return nil
+//	}
+type Change[S ~string] struct {
+	// From is the state the machine is leaving.
+	From S
+
+	// To is the state the machine is entering.
+	To S
+}
+
+// StateHook is a guard or a lifecycle callback on the simple surface.
+//
+// The rules match Hook: a guard must not have side effects, because CanTransitionTo consults it without the move
+// happening, while exit and enter hooks may do real work and run only for a transition that is taking place.
+//
+// Example:
+//
+//	func(ctx context.Context, c fsm.Change[OrderState]) error {
+//		return notify(ctx, c.To)
+//	}
+type StateHook[S ~string] func(context.Context, Change[S]) error
+
+// Machine holds one current state and applies only the transitions its graph declares, naming them by destination.
+//
+// This is the simple surface. It is built on the same engine as EventMachine, with each edge's event name bound to its
+// target state, but that binding never surfaces: no type, method, error message, or hook argument here mentions an
+// event.
+//
+// Like EventMachine it is not safe for concurrent use and holds no lock. Build one with New or MustNew.
+//
+// Example:
+//
+//	m := fsm.MustNew(orderGraph, StateDraft)
+//	err := m.TransitionTo(ctx, StateReview)
+type Machine[S ~string] struct {
+	inner *EventMachine[S, S]
+}
+
+// New returns a machine positioned at initial, or ErrUnknownState if the graph never names that state.
+//
+// As with NewEventMachine, construction is the boundary where a state read from storage enters the program, which is
+// why it is validated here.
+//
+// Example:
+//
+//	m, err := fsm.New(orderGraph, order.Status)
+//	if err != nil {
+//		// the stored status is not in the graph
+//	}
+func New[S ~string](graph Graph[S], initial S) (*Machine[S], error) {
+	inner, err := NewEventMachine(graph.inner, initial)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Machine[S]{inner: inner}, nil
+}
+
+// MustNew returns a machine positioned at initial and panics if the graph never names that state.
+//
+// Use it where the initial state is a compile-time constant; prefer New when the state came from storage or a request.
+//
+// Example:
+//
+//	m := fsm.MustNew(orderGraph, StateDraft)
+func MustNew[S ~string](graph Graph[S], initial S) *Machine[S] {
+	machine, err := New(graph, initial)
+	if err != nil {
+		panic(err)
+	}
+
+	return machine
+}
+
+// Current returns the state the machine is in.
+//
+// Example:
+//
+//	fmt.Println(m.Current())
+//	// Draft
+func (m *Machine[S]) Current() S {
+	return m.inner.Current()
+}
+
+// Is reports whether the machine is in state.
+//
+// Example:
+//
+//	if m.Is(StateShipped) {
+//		// ...
+//	}
+func (m *Machine[S]) Is(state S) bool {
+	return m.inner.Is(state)
+}
+
+// String returns the current state name, so Machine satisfies fmt.Stringer.
+//
+// Example:
+//
+//	fmt.Printf("%s", m)
+//	// Draft
+func (m *Machine[S]) String() string {
+	return m.inner.String()
+}
+
+// Guard registers a predicate on the single edge from -> to.
+//
+// It must not have side effects, because CanTransitionTo consults it without the move happening. Registering again
+// replaces the previous guard.
+//
+// Example:
+//
+//	m.Guard(StateReview, StatePaid, func(ctx context.Context, c fsm.Change[OrderState]) error {
+//		if order.Total == 0 {
+//			return ErrNothingToPay
+//		}
+//		return nil
+//	})
+func (m *Machine[S]) Guard(from, to S, hook StateHook[S]) *Machine[S] {
+	m.inner.Guard(from, to, adapt(hook))
+
+	return m
+}
+
+// OnExit registers the hook that runs when the machine leaves state, reporting its error without stopping the move.
+//
+// A state has one exit hook, shared with OnExitBlocking; whichever is called last decides both the function and
+// whether it blocks. Overwriting is silent.
+//
+// Example:
+//
+//	m.OnExit(StatePaid, func(ctx context.Context, c fsm.Change[OrderState]) error {
+//		return pushMetrics(ctx, c.From, c.To)
+//	})
+func (m *Machine[S]) OnExit(state S, hook StateHook[S]) *Machine[S] {
+	m.inner.OnExit(state, adapt(hook))
+
+	return m
+}
+
+// OnExitBlocking registers the hook that runs when the machine leaves state, aborting the transition if it fails.
+//
+// It runs before the state changes, so an abort leaves the machine where it was and the enter hook never runs.
+//
+// Example:
+//
+//	m.OnExitBlocking(StatePaid, func(ctx context.Context, c fsm.Change[OrderState]) error {
+//		return releaseHold(ctx, order)
+//	})
+func (m *Machine[S]) OnExitBlocking(state S, hook StateHook[S]) *Machine[S] {
+	m.inner.OnExitBlocking(state, adapt(hook))
+
+	return m
+}
+
+// OnEnter registers the hook that runs once the machine has entered state.
+//
+// It runs after the state has changed and cannot stop the transition; its error is reported to the caller.
+//
+// Example:
+//
+//	m.OnEnter(StateShipped, func(ctx context.Context, c fsm.Change[OrderState]) error {
+//		return notify(ctx, order)
+//	})
+func (m *Machine[S]) OnEnter(state S, hook StateHook[S]) *Machine[S] {
+	m.inner.OnEnter(state, adapt(hook))
+
+	return m
+}
+
+// CanTransitionTo reports whether moving to the given state is permitted, returning nil when it is.
+//
+// It checks that the edge exists and asks the guard registered on it, and never moves the machine. It reports whether
+// the move is permitted, not that it will succeed: a blocking exit hook can still abort a move this approved.
+//
+// Example:
+//
+//	if err := m.CanTransitionTo(ctx, StateShipped); err != nil {
+//		// not allowed from here, and err says why
+//	}
+func (m *Machine[S]) CanTransitionTo(ctx context.Context, to S) error {
+	return simplify(to, m.inner.CanFire(ctx, to))
+}
+
+// TransitionTo moves the machine to the given state, if the graph declares an edge leading there.
+//
+// The stages run in the same fixed order as on the labeled surface: the edge is resolved, the guard is consulted, the
+// exit hook runs, the state changes, and the enter hook runs. Calling it from inside a hook returns ErrReentrant.
+//
+// Example:
+//
+//	if err := m.TransitionTo(ctx, StateReview); err != nil {
+//		// fsm: cannot transition Draft -> Review: invalid transition
+//	}
+func (m *Machine[S]) TransitionTo(ctx context.Context, to S) error {
+	return simplify(to, m.inner.Fire(ctx, to))
+}
+
+// ForceState sets the current state directly, ignoring the graph.
+//
+// No edge is required, no guard is consulted, and no hook runs. As on the labeled surface it exists for operational
+// repair, not for ordinary application code, and checks only that the graph names the state.
+//
+// Example:
+//
+//	// in a repair script, not in a request handler
+//	if err := m.ForceState(StateDraft); err != nil {
+//		// the graph never declares that state
+//	}
+func (m *Machine[S]) ForceState(state S) error {
+	return m.inner.ForceState(state)
+}
+
+// adapt turns a StateHook into the Hook the engine expects, dropping the event the simple surface does not have.
+func adapt[S ~string](hook StateHook[S]) Hook[S, S] {
+	if hook == nil {
+		return nil
+	}
+
+	return func(ctx context.Context, transition Transition[S, S]) error {
+		return hook(ctx, Change[S]{From: transition.From, To: transition.To})
+	}
+}
+
+// simplify rewrites an engine error so it never mentions events.
+//
+// A resolve failure is the interesting case: the engine found no edge, so it has no target to name, but the caller
+// named one explicitly, and it is restored here. Joined errors are rewritten element by element, so an exit and an
+// enter failure in the same call both survive.
+func simplify[S ~string](to S, err error) error {
+	if err == nil {
+		return nil
+	}
+
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		parts := joined.Unwrap()
+		rewritten := make([]error, 0, len(parts))
+
+		for _, part := range parts {
+			rewritten = append(rewritten, simplify[S](to, part))
+		}
+
+		return errors.Join(rewritten...)
+	}
+
+	var transitionErr *TransitionError[S, S]
+	if !errors.As(err, &transitionErr) {
+		return err
+	}
+
+	if transitionErr.Phase == PhaseResolve {
+		return fmt.Errorf("fsm: cannot transition %s -> %s: %w", transitionErr.From, to, transitionErr.Err)
+	}
+
+	return fmt.Errorf("fsm: %s %s -> %s: %w", transitionErr.Phase, transitionErr.From, transitionErr.To, transitionErr.Err)
 }
